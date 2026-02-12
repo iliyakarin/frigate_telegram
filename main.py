@@ -46,6 +46,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
 MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
 UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "60"))  # seconds for Telegram media upload (tunnel-safe)
+SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes")  # send clip.mp4 instead of preview.gif for HD quality
 
 # ─────────────────────────── Logging ─────────────────────────────────
 
@@ -264,6 +265,12 @@ async def fetch_event_gif(client: httpx.AsyncClient, event_id: str) -> bytes | N
     return await fetch_media_with_retry(client, url, f"preview.gif for {event_id}", "image/gif")
 
 
+async def fetch_event_clip(client: httpx.AsyncClient, event_id: str) -> bytes | None:
+    """Fetch the clip.mp4 for an event (HD quality video)."""
+    url = f"{FRIGATE_URL}/api/events/{event_id}/clip.mp4"
+    return await fetch_media_with_retry(client, url, f"clip.mp4 for {event_id}", "video/mp4")
+
+
 async def fetch_event_thumbnail(client: httpx.AsyncClient, event_id: str) -> bytes | None:
     """Fetch the thumbnail JPEG for an event."""
     url = f"{FRIGATE_URL}/api/events/{event_id}/thumbnail.jpg"
@@ -319,28 +326,45 @@ def format_caption(event: dict) -> str:
     """Build an HTML caption for the Telegram animation message.
 
     Includes face recognition sub_label when available from Frigate.
+    Handles sub_label as both [name, score] array and plain string.
     """
     event_id = event.get("id", "unknown")
     camera = event.get("camera", "unknown")
     label = event.get("label", "object")
-    sub_label = event.get("sub_label")
+    raw_sub_label = event.get("sub_label")
     zones = ", ".join(event.get("zones", [])) or "N/A"
     score = event.get("top_score")
     score_str = f"{score:.0%}" if score else "N/A"
     start_time = _epoch_to_datetime(event.get("start_time"))
     end_time = _epoch_to_datetime(event.get("end_time"))
 
+    # Parse sub_label — Frigate returns either ["name", score] or a plain string
+    sub_label_name = None
+    sub_label_score = None
+    if isinstance(raw_sub_label, list) and len(raw_sub_label) >= 1:
+        sub_label_name = str(raw_sub_label[0])
+        if len(raw_sub_label) >= 2:
+            try:
+                sub_label_score = float(raw_sub_label[1])
+            except (ValueError, TypeError):
+                pass
+    elif isinstance(raw_sub_label, str) and raw_sub_label:
+        sub_label_name = raw_sub_label
+
     lines = [
         f"🚨 <b>Detection Alert</b>",
         f"",
         f"📷 <b>Camera:</b> {camera}",
         f"🏷️ <b>Label:</b> {label} ({score_str})",
-        f"� <b>Zone(s):</b> {zones}",
+        f"📍 <b>Zone(s):</b> {zones}",
     ]
 
     # Face recognition: show recognized name when sub_label is present
-    if sub_label:
-        lines.append(f"� <b>Recognized:</b> {sub_label}")
+    if sub_label_name:
+        if sub_label_score is not None:
+            lines.append(f"👤 <b>Recognized:</b> {sub_label_name} ({sub_label_score:.0%})")
+        else:
+            lines.append(f"👤 <b>Recognized:</b> {sub_label_name}")
 
     lines.append(f"📅 <b>Time:</b> {start_time}")
 
@@ -355,11 +379,8 @@ def format_caption(event: dict) -> str:
         event_url = f"{EXTERNAL_URL}/events/{event_id}"
         lines.append(f'🔗 <a href="{event_url}">View Event in Frigate</a>')
 
-    # Direct clip link via Frigate API
-    clip_url = f"{FRIGATE_URL}/api/events/{event_id}/clip.mp4"
-    lines.append(f'🎬 <a href="{clip_url}">Download Event Clip</a>')
-
     return "\n".join(lines)
+
 
 
 # ─────────────────────── Telegram Notification ───────────────────────
@@ -370,11 +391,12 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 
     Flow:
     1. Wait MEDIA_WAIT_TIMEOUT seconds so Frigate can generate the preview.
-    2. Fetch GIF, thumbnail, and camera snapshot in parallel.
+    2. Fetch clip/GIF, thumbnail, and camera snapshot in parallel.
     3. Send ONE message:
-       - GIF available  → send_animation (GIF as media, event caption)
-       - No GIF, photo  → send_photo (snapshot/thumbnail, event caption)
-       - No media at all → send_message (text-only fallback)
+       - SEND_CLIP + clip → send_video (HD clip.mp4)
+       - GIF available    → send_animation (preview.gif)
+       - No GIF, photo    → send_photo (snapshot/thumbnail)
+       - No media at all  → send_message (text-only fallback)
 
     Media is wrapped with an explicit filename so Telegram recognises the
     Content-Type correctly (fixes the octet-stream / broken-file issue).
@@ -395,21 +417,37 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
     gif_task = asyncio.create_task(fetch_event_gif(http_client, event_id))
     thumb_task = asyncio.create_task(fetch_event_thumbnail(http_client, event_id))
     snap_task = asyncio.create_task(fetch_camera_snapshot(http_client, camera))
+    clip_task = asyncio.create_task(fetch_event_clip(http_client, event_id)) if SEND_CLIP else None
 
     gif_data, thumb_data, snap_data = await asyncio.gather(gif_task, thumb_task, snap_task)
+    clip_data = await clip_task if clip_task else None
 
     # Choose the best available photo (snapshot is higher quality than thumbnail)
     photo_data = snap_data or thumb_data
 
     try:
-        if gif_data:
-            # ── Primary: send GIF animation with caption ─────────────
-            # filename= ensures Telegram sees "image/gif" not "octet-stream".
-            # UPLOAD_TIMEOUT handles slow tunnel connections.
+        if SEND_CLIP and clip_data:
+            # ── HD: send clip.mp4 as video (auto-plays in Telegram) ───
+            await bot.send_video(
+                chat_id=TELEGRAM_CHAT_ID,
+                video=clip_data,
+                thumbnail=photo_data,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                filename="clip.mp4",
+                supports_streaming=True,
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
+                connect_timeout=15,
+            )
+            logger.info("Event %s → sent HD video clip with caption ✓", event_id)
+
+        elif gif_data:
+            # ── Standard: send preview.gif as animation ───────────────
             await bot.send_animation(
                 chat_id=TELEGRAM_CHAT_ID,
                 animation=gif_data,
-                thumbnail=photo_data,  # optional inline thumbnail
+                thumbnail=photo_data,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename="preview.gif",
@@ -538,6 +576,7 @@ async def main() -> None:
     logger.info("Polling interval: %ds", POLLING_INTERVAL)
     logger.info("Media wait timeout: %ds", MEDIA_WAIT_TIMEOUT)
     logger.info("Upload timeout: %ds", UPLOAD_TIMEOUT)
+    logger.info("Send HD clip: %s", SEND_CLIP)
     logger.info("Timezone: %s", TIMEZONE)
     logger.info("Debug: %s", DEBUG)
 

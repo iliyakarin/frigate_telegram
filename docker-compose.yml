@@ -44,6 +44,7 @@ services:
       - POLLING_INTERVAL=60                            # Seconds between polls (default: 60)
       - MEDIA_WAIT_TIMEOUT=5                             # Seconds to wait before fetching media (default: 5)
       - UPLOAD_TIMEOUT=60                                 # Seconds for Telegram upload timeout (default: 60, increase for slow tunnels)
+      - SEND_CLIP=false                                   # Send HD clip.mp4 instead of preview.gif (default: false)
       - TIMEZONE=UTC                                   # Timezone for timestamps (default: UTC)
       - LOCALES=en-US                                  # Locale for formatting (default: en-US)
       - DEBUG=false                                    # Verbose logging (default: false)
