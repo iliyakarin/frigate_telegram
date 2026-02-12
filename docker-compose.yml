@@ -1,0 +1,53 @@
+services:
+  # ── Frigate NVR (uncomment to run in the same compose file) ──────
+  # frigate:
+  #   container_name: frigate
+  #   image: ghcr.io/blakeblackshear/frigate:stable
+  #   shm_size: 500m
+  #   restart: unless-stopped
+  #   stop_grace_period: 30s
+  #   environment:
+  #     - TZ=America/Chicago
+  #   volumes:
+  #     - /path/to/frigate/config:/config              # Frigate config directory
+  #     - /path/to/frigate/media:/media/frigate         # Recordings / clips / snapshots
+  #     - type: tmpfs                                   # Optional: cache in RAM
+  #       target: /tmp/cache
+  #       tmpfs:
+  #         size: 2G
+  #   ports:
+  #     - "8971:8971"
+  #     - "8554:8554"
+
+  frigate-telegram:
+    # build: .  only needed for local development
+    image: ghcr.io/ikarin/frigate-telegram:latest
+    container_name: frigate-telegram
+    restart: unless-stopped
+    # depends_on:                                      # Uncomment if running Frigate in the same compose file
+    #   - frigate
+    environment:
+      # ── Required ──────────────────────────────────────────────
+      - FRIGATE_URL=http://frigate:5000               # Use container name when in the same compose network
+      - TELEGRAM_BOT_TOKEN=your-bot-token-here        # From @BotFather
+      - TELEGRAM_CHAT_ID=your-chat-id-here            # Target chat/group ID
+
+      # ── Camera / Zone Matrix ──────────────────────────────────
+      # Format: camera1:zone_a,zone_b;camera2:all
+      # Omit entirely to monitor ALL cameras and zones
+      - MONITOR_CONFIG=front_door:yard,driveway;back_camera:all
+
+      # ── Optional ──────────────────────────────────────────────
+      - FRIGATE_EXTERNAL_URL=https://frigate.example.com  # Public URL for clip links (defaults to FRIGATE_URL)
+      # - FRIGATE_USERNAME=                            # Basic auth username (if Frigate auth is enabled)
+      # - FRIGATE_PASSWORD=                            # Basic auth password
+      - POLLING_INTERVAL=60                            # Seconds between polls (default: 60)
+      - MEDIA_WAIT_TIMEOUT=5                             # Seconds to wait before fetching media (default: 5)
+      - TIMEZONE=UTC                                   # Timezone for timestamps (default: UTC)
+      - LOCALES=en-US                                  # Locale for formatting (default: en-US)
+      - DEBUG=false                                    # Verbose logging (default: false)
+    volumes:
+      - frigate-telegram-data:/app/data                # Persist notification state across restarts
+
+volumes:
+  frigate-telegram-data:

@@ -1,0 +1,567 @@
+"""
+Frigate-Telegram Bot — Python 3.11+
+Polls the Frigate HTTP API for detection events and sends rich notifications
+to Telegram as a single animated GIF message with event details in the caption.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+from telegram import Bot, Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ─────────────────────────── Configuration ───────────────────────────
+
+FRIGATE_URL = os.environ.get("FRIGATE_URL", "").rstrip("/")
+FRIGATE_EXTERNAL_URL = os.environ.get("FRIGATE_EXTERNAL_URL", FRIGATE_URL).rstrip("/")
+FRIGATE_USERNAME = os.environ.get("FRIGATE_USERNAME")
+FRIGATE_PASSWORD = os.environ.get("FRIGATE_PASSWORD")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
+POLLING_INTERVAL = int(os.environ.get("POLLING_INTERVAL", "60"))
+
+TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+LOCALES = os.environ.get("LOCALES", "en-US")
+DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "1", "yes")
+
+STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
+
+# Media fetching settings
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds between retry attempts
+MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
+
+# ─────────────────────────── Logging ─────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("frigate-telegram")
+
+# Suppress noisy third-party loggers unless in debug mode
+if not DEBUG:
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+
+# ─────────────────────── Monitor Config Parser ───────────────────────
+
+
+def parse_monitor_config(raw: str) -> dict[str, list[str]]:
+    """Parse MONITOR_CONFIG env var into a camera→zones mapping.
+
+    Format:  camera1:zone_a,zone_b;camera2:all
+    Returns: {"camera1": ["zone_a", "zone_b"], "camera2": ["all"]}
+
+    If the string is empty, returns an empty dict (= monitor everything).
+    """
+    if not raw.strip():
+        return {}
+
+    config: dict[str, list[str]] = {}
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            camera, zones_str = entry.split(":", 1)
+            zones = [z.strip() for z in zones_str.split(",") if z.strip()]
+            config[camera.strip()] = zones if zones else ["all"]
+        else:
+            # Camera name without zones → monitor all zones
+            config[entry.strip()] = ["all"]
+    return config
+
+
+MONITOR_CONFIG = parse_monitor_config(MONITOR_CONFIG_RAW)
+
+# ─────────────────────── Notification State ──────────────────────────
+
+
+class NotificationState:
+    """Persist notification enabled/disabled state to a JSON file."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._enabled: bool = True
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self._path.exists():
+                data = json.loads(self._path.read_text())
+                self._enabled = data.get("enabled", True)
+                logger.info("Loaded notification state: %s", "enabled" if self._enabled else "disabled")
+        except Exception:
+            logger.warning("Could not load state file; defaulting to enabled")
+            self._enabled = True
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps({"enabled": self._enabled}))
+        except Exception:
+            logger.warning("Could not persist state file")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def enable(self) -> None:
+        self._enabled = True
+        self._save()
+
+    def disable(self) -> None:
+        self._enabled = False
+        self._save()
+
+
+state = NotificationState(STATE_FILE)
+
+# ─────────────────────── Frigate HTTP Client ─────────────────────────
+
+
+def _http_auth() -> httpx.BasicAuth | None:
+    if FRIGATE_USERNAME and FRIGATE_PASSWORD:
+        return httpx.BasicAuth(FRIGATE_USERNAME, FRIGATE_PASSWORD)
+    return None
+
+
+async def check_frigate_status(client: httpx.AsyncClient) -> bool:
+    """Return True if Frigate is reachable."""
+    try:
+        resp = await client.get(f"{FRIGATE_URL}/api/version", auth=_http_auth(), timeout=10)
+        resp.raise_for_status()
+        logger.info("Frigate is up — version: %s", resp.text.strip())
+        return True
+    except Exception as exc:
+        logger.error("Cannot reach Frigate at %s: %s", FRIGATE_URL, exc)
+        return False
+
+
+async def fetch_events(client: httpx.AsyncClient, after_ts: float) -> list[dict]:
+    """Fetch events from Frigate API for all monitored cameras since *after_ts*.
+
+    If MONITOR_CONFIG is empty, fetches all cameras without filtering.
+    Deduplicates events by ID across cameras.
+    """
+    seen_ids: set[str] = set()
+    all_events: list[dict] = []
+
+    cameras = list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else [None]
+
+    for camera in cameras:
+        params: dict[str, str | float] = {"after": after_ts}
+        if camera:
+            params["camera"] = camera
+
+        try:
+            resp = await client.get(
+                f"{FRIGATE_URL}/api/events",
+                params=params,
+                auth=_http_auth(),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+            logger.debug("Fetched %d events for camera=%s", len(events), camera or "all")
+
+            for ev in events:
+                eid = ev.get("id")
+                if eid and eid not in seen_ids:
+                    seen_ids.add(eid)
+                    all_events.append(ev)
+        except Exception as exc:
+            logger.warning("Error fetching events for camera=%s: %s", camera or "all", exc)
+
+    return all_events
+
+
+async def fetch_media_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    label: str,
+    expected_content_type: str | None = None,
+) -> bytes | None:
+    """Fetch media from a URL with retry logic for 404/transient errors.
+
+    Args:
+        url: Full URL to fetch.
+        label: Human-readable label for logging (e.g. 'preview.gif for event X').
+        expected_content_type: If set, warn when the response Content-Type
+            doesn't match (helps detect octet-stream issues).
+
+    Returns:
+        Raw bytes or None if all retries failed.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = await client.get(url, auth=_http_auth(), timeout=15)
+
+            # 404 means Frigate hasn't generated the media yet — retry
+            if resp.status_code == 404:
+                raise httpx.HTTPStatusError(
+                    f"404 Not Found (media not ready)",
+                    request=resp.request,
+                    response=resp,
+                )
+
+            resp.raise_for_status()
+
+            # Verify content type if expected
+            ct = resp.headers.get("content-type", "")
+            if expected_content_type and expected_content_type not in ct:
+                logger.warning(
+                    "%s: expected Content-Type containing '%s', got '%s'",
+                    label, expected_content_type, ct,
+                )
+
+            # Reject empty responses
+            if len(resp.content) < 100:
+                logger.warning("%s: response too small (%d bytes), retrying", label, len(resp.content))
+                raise ValueError(f"Response too small: {len(resp.content)} bytes")
+
+            logger.debug("Fetched %s (attempt %d, %d bytes, %s)", label, attempt, len(resp.content), ct)
+            return resp.content
+
+        except Exception as exc:
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "Failed to fetch %s (attempt %d/%d): %s — retrying in %ds",
+                    label, attempt, MAX_RETRIES, exc, RETRY_DELAY,
+                )
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                logger.error(
+                    "Failed to fetch %s after %d attempts: %s",
+                    label, MAX_RETRIES, exc,
+                )
+    return None
+
+
+async def fetch_event_gif(client: httpx.AsyncClient, event_id: str) -> bytes | None:
+    """Fetch the preview GIF for an event."""
+    url = f"{FRIGATE_URL}/api/events/{event_id}/preview.gif"
+    return await fetch_media_with_retry(client, url, f"preview.gif for {event_id}", "image/gif")
+
+
+async def fetch_event_thumbnail(client: httpx.AsyncClient, event_id: str) -> bytes | None:
+    """Fetch the thumbnail JPEG for an event."""
+    url = f"{FRIGATE_URL}/api/events/{event_id}/thumbnail.jpg"
+    return await fetch_media_with_retry(client, url, f"thumbnail.jpg for {event_id}", "image/jpeg")
+
+
+async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes | None:
+    """Fetch the latest snapshot JPEG from a camera."""
+    url = f"{FRIGATE_URL}/api/{camera}/latest.jpg?bbox=1"
+    return await fetch_media_with_retry(client, url, f"latest.jpg for {camera}", "image/jpeg")
+
+
+# ─────────────────────── Event Filtering ─────────────────────────────
+
+
+def event_matches_config(event: dict) -> bool:
+    """Check whether an event matches the MONITOR_CONFIG zones filter.
+
+    If MONITOR_CONFIG is empty, all events pass.
+    """
+    if not MONITOR_CONFIG:
+        return True
+
+    camera = event.get("camera", "")
+    if camera not in MONITOR_CONFIG:
+        return False
+
+    allowed_zones = MONITOR_CONFIG[camera]
+    if "all" in allowed_zones:
+        return True
+
+    event_zones = event.get("zones", [])
+    # Match if any event zone is in the allowed list
+    return bool(set(event_zones) & set(allowed_zones))
+
+
+# ─────────────────────── Caption Formatting ──────────────────────────
+
+
+def _epoch_to_datetime(epoch: float | None) -> str:
+    """Convert epoch timestamp to a human-readable datetime string."""
+    if epoch is None or epoch == 0:
+        return "N/A"
+    try:
+        tz = ZoneInfo(TIMEZONE)
+        dt = datetime.fromtimestamp(epoch, tz=tz)
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def format_caption(event: dict) -> str:
+    """Build an HTML caption for the Telegram animation message."""
+    event_id = event.get("id", "unknown")
+    camera = event.get("camera", "unknown")
+    label = event.get("label", "object")
+    zones = ", ".join(event.get("zones", [])) or "N/A"
+    score = event.get("top_score")
+    score_str = f"{score:.0%}" if score else "N/A"
+    start_time = _epoch_to_datetime(event.get("start_time"))
+    end_time = _epoch_to_datetime(event.get("end_time"))
+
+    # Build clip URL with 30s padding (matching original project behavior)
+    start_ts = int(event.get("start_time", 0))
+    end_ts = int(event.get("end_time") or event.get("start_time", 0))
+    clip_url = (
+        f"{FRIGATE_EXTERNAL_URL}/api/events/{event_id}/clip.mp4"
+    )
+
+    lines = [
+        f"🚨 <b>Detection Alert</b>",
+        f"",
+        f"📷 <b>Camera:</b> {camera}",
+        f"🏷️ <b>Label:</b> {label} ({score_str})",
+        f"📍 <b>Zone(s):</b> {zones}",
+        f"🕐 <b>Start:</b> {start_time}",
+        f"🕑 <b>End:</b> {end_time}",
+        f"",
+        f"🎬 <a href=\"{clip_url}\">View Event Clip</a>",
+    ]
+    return "\n".join(lines)
+
+
+# ─────────────────────── Telegram Notification ───────────────────────
+
+
+async def send_event_notification(bot: Bot, event: dict, http_client: httpx.AsyncClient) -> None:
+    """Send a **single** consolidated Telegram message for a Frigate event.
+
+    Flow:
+    1. Wait MEDIA_WAIT_TIMEOUT seconds so Frigate can generate the preview.
+    2. Fetch GIF, thumbnail, and camera snapshot in parallel.
+    3. Send ONE message:
+       - GIF available  → send_animation (GIF as media, event caption)
+       - No GIF, photo  → send_photo (snapshot/thumbnail, event caption)
+       - No media at all → send_message (text-only fallback)
+
+    Media is wrapped with an explicit filename so Telegram recognises the
+    Content-Type correctly (fixes the octet-stream / broken-file issue).
+    """
+    event_id = event.get("id", "unknown")
+    camera = event.get("camera", "unknown")
+    caption = format_caption(event)
+
+    # ── Wait for Frigate to generate previews ────────────────────────
+    if MEDIA_WAIT_TIMEOUT > 0:
+        logger.debug(
+            "Event %s: waiting %ds for Frigate to generate media…",
+            event_id, MEDIA_WAIT_TIMEOUT,
+        )
+        await asyncio.sleep(MEDIA_WAIT_TIMEOUT)
+
+    # ── Fetch all media in parallel ──────────────────────────────────
+    gif_task = asyncio.create_task(fetch_event_gif(http_client, event_id))
+    thumb_task = asyncio.create_task(fetch_event_thumbnail(http_client, event_id))
+    snap_task = asyncio.create_task(fetch_camera_snapshot(http_client, camera))
+
+    gif_data, thumb_data, snap_data = await asyncio.gather(gif_task, thumb_task, snap_task)
+
+    # Choose the best available photo (snapshot is higher quality than thumbnail)
+    photo_data = snap_data or thumb_data
+
+    try:
+        if gif_data:
+            # ── Primary: send GIF animation with caption ─────────────
+            # Wrapping in InputFile with filename= ensures Telegram sees
+            # "image/gif" instead of "application/octet-stream".
+            await bot.send_animation(
+                chat_id=TELEGRAM_CHAT_ID,
+                animation=gif_data,
+                thumbnail=photo_data,  # optional inline thumbnail
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                filename="preview.gif",
+                read_timeout=30,
+                write_timeout=30,
+            )
+            logger.info("Event %s → sent animation with caption ✓", event_id)
+
+        elif photo_data:
+            # ── Fallback 1: send photo with caption ──────────────────
+            await bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=photo_data,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                filename="snapshot.jpg",
+                read_timeout=30,
+                write_timeout=30,
+            )
+            logger.info("Event %s → sent photo with caption (GIF unavailable)", event_id)
+
+        else:
+            # ── Fallback 2: text-only ────────────────────────────────
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=caption,
+                parse_mode=ParseMode.HTML,
+            )
+            logger.info("Event %s → sent text only (no media available)", event_id)
+
+    except Exception as exc:
+        logger.error("Failed to send Telegram notification for event %s: %s", event_id, exc)
+
+
+# ─────────────────── Telegram Command Handlers ───────────────────────
+
+
+async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state.enable()
+    await update.message.reply_text("✅ Notifications enabled.")
+    logger.info("Notifications enabled via Telegram command.")
+
+
+async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state.disable()
+    await update.message.reply_text("🔕 Notifications disabled.")
+    logger.info("Notifications disabled via Telegram command.")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status_emoji = "✅" if state.enabled else "🔕"
+    cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "all"
+    lines = [
+        f"<b>Frigate-Telegram Status</b>",
+        f"",
+        f"Notifications: {status_emoji} {'enabled' if state.enabled else 'disabled'}",
+        f"Polling interval: {POLLING_INTERVAL}s",
+        f"Monitored cameras: {cameras}",
+        f"Frigate URL: {FRIGATE_URL}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ─────────────────────── Main Polling Loop ───────────────────────────
+
+
+async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
+    """Continuously poll Frigate for new events and send notifications."""
+    last_poll_ts = time.time()
+    logger.info(
+        "Polling started — interval=%ds, cameras=%s",
+        POLLING_INTERVAL,
+        list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "all",
+    )
+
+    while True:
+        try:
+            if state.enabled:
+                poll_after = last_poll_ts
+                last_poll_ts = time.time()
+
+                events = await fetch_events(http_client, poll_after)
+                matched = [ev for ev in events if event_matches_config(ev)]
+
+                if matched:
+                    logger.info("Processing %d new event(s)", len(matched))
+                    for event in matched:
+                        await send_event_notification(bot, event, http_client)
+                    logger.info("All events processed.")
+                else:
+                    logger.debug("No new matching events.")
+            else:
+                logger.debug("Notifications disabled — skipping poll.")
+        except Exception as exc:
+            logger.error("Error in polling loop: %s", exc, exc_info=DEBUG)
+
+        await asyncio.sleep(POLLING_INTERVAL)
+
+
+# ─────────────────────────── Entrypoint ──────────────────────────────
+
+
+async def main() -> None:
+    # Validate required config
+    missing = []
+    if not FRIGATE_URL:
+        missing.append("FRIGATE_URL")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        logger.error("Missing required environment variables: %s", ", ".join(missing))
+        sys.exit(1)
+
+    logger.info("=== Frigate-Telegram Bot Starting ===")
+    logger.info("Frigate URL: %s", FRIGATE_URL)
+    logger.info("External URL: %s", FRIGATE_EXTERNAL_URL)
+    logger.info("Monitor config: %s", MONITOR_CONFIG if MONITOR_CONFIG else "all cameras/zones")
+    logger.info("Polling interval: %ds", POLLING_INTERVAL)
+    logger.info("Media wait timeout: %ds", MEDIA_WAIT_TIMEOUT)
+    logger.info("Timezone: %s", TIMEZONE)
+    logger.info("Debug: %s", DEBUG)
+
+    # Build the Telegram application with command handlers
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("enable_notifications", cmd_enable))
+    app.add_handler(CommandHandler("disable_notifications", cmd_disable))
+    app.add_handler(CommandHandler("status", cmd_status))
+
+    async with httpx.AsyncClient() as http_client:
+        # Check Frigate is reachable before starting
+        if not await check_frigate_status(http_client):
+            logger.error("Frigate is not reachable. Exiting.")
+            sys.exit(1)
+
+        # Initialize the Telegram application and start command polling
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        logger.info("Telegram bot is active. Listening for commands.")
+
+        try:
+            await polling_loop(app.bot, http_client)
+        except asyncio.CancelledError:
+            logger.info("Polling loop cancelled.")
+        finally:
+            # Graceful shutdown
+            logger.info("Shutting down…")
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+
+
+if __name__ == "__main__":
+    # Handle SIGTERM/SIGINT for graceful Docker stops
+    loop = asyncio.new_event_loop()
+
+    def _shutdown(sig: signal.Signals) -> None:
+        logger.info("Received signal %s, shutting down…", sig.name)
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _shutdown, sig)
+
+    try:
+        loop.run_until_complete(main())
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.close()
