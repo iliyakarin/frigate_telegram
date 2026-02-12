@@ -23,9 +23,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ─────────────────────────── Configuration ───────────────────────────
 
 FRIGATE_URL = os.environ.get("FRIGATE_URL", "").rstrip("/")
-FRIGATE_EXTERNAL_URL = os.environ.get("FRIGATE_EXTERNAL_URL", FRIGATE_URL).rstrip("/")
 FRIGATE_USERNAME = os.environ.get("FRIGATE_USERNAME")
 FRIGATE_PASSWORD = os.environ.get("FRIGATE_PASSWORD")
+
+# External URL for public event links (e.g. via Cloudflare Tunnel)
+EXTERNAL_URL = os.environ.get("EXTERNAL_URL", "").rstrip("/")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -43,6 +45,7 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
 MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
+UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "60"))  # seconds for Telegram media upload (tunnel-safe)
 
 # ─────────────────────────── Logging ─────────────────────────────────
 
@@ -313,34 +316,49 @@ def _epoch_to_datetime(epoch: float | None) -> str:
 
 
 def format_caption(event: dict) -> str:
-    """Build an HTML caption for the Telegram animation message."""
+    """Build an HTML caption for the Telegram animation message.
+
+    Includes face recognition sub_label when available from Frigate.
+    """
     event_id = event.get("id", "unknown")
     camera = event.get("camera", "unknown")
     label = event.get("label", "object")
+    sub_label = event.get("sub_label")
     zones = ", ".join(event.get("zones", [])) or "N/A"
     score = event.get("top_score")
     score_str = f"{score:.0%}" if score else "N/A"
     start_time = _epoch_to_datetime(event.get("start_time"))
     end_time = _epoch_to_datetime(event.get("end_time"))
 
-    # Build clip URL with 30s padding (matching original project behavior)
-    start_ts = int(event.get("start_time", 0))
-    end_ts = int(event.get("end_time") or event.get("start_time", 0))
-    clip_url = (
-        f"{FRIGATE_EXTERNAL_URL}/api/events/{event_id}/clip.mp4"
-    )
-
     lines = [
         f"🚨 <b>Detection Alert</b>",
         f"",
         f"📷 <b>Camera:</b> {camera}",
         f"🏷️ <b>Label:</b> {label} ({score_str})",
-        f"📍 <b>Zone(s):</b> {zones}",
-        f"🕐 <b>Start:</b> {start_time}",
-        f"🕑 <b>End:</b> {end_time}",
-        f"",
-        f"🎬 <a href=\"{clip_url}\">View Event Clip</a>",
+        f"� <b>Zone(s):</b> {zones}",
     ]
+
+    # Face recognition: show recognized name when sub_label is present
+    if sub_label:
+        lines.append(f"� <b>Recognized:</b> {sub_label}")
+
+    lines.append(f"📅 <b>Time:</b> {start_time}")
+
+    # Only show end time if event has ended
+    if event.get("end_time"):
+        lines.append(f"🕑 <b>End:</b> {end_time}")
+
+    lines.append("")
+
+    # External event link (Cloudflare Tunnel URL)
+    if EXTERNAL_URL:
+        event_url = f"{EXTERNAL_URL}/events/{event_id}"
+        lines.append(f'🔗 <a href="{event_url}">View Event in Frigate</a>')
+
+    # Direct clip link via Frigate API
+    clip_url = f"{FRIGATE_URL}/api/events/{event_id}/clip.mp4"
+    lines.append(f'🎬 <a href="{clip_url}">Download Event Clip</a>')
+
     return "\n".join(lines)
 
 
@@ -386,8 +404,8 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
     try:
         if gif_data:
             # ── Primary: send GIF animation with caption ─────────────
-            # Wrapping in InputFile with filename= ensures Telegram sees
-            # "image/gif" instead of "application/octet-stream".
+            # filename= ensures Telegram sees "image/gif" not "octet-stream".
+            # UPLOAD_TIMEOUT handles slow tunnel connections.
             await bot.send_animation(
                 chat_id=TELEGRAM_CHAT_ID,
                 animation=gif_data,
@@ -395,8 +413,9 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename="preview.gif",
-                read_timeout=30,
-                write_timeout=30,
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
+                connect_timeout=15,
             )
             logger.info("Event %s → sent animation with caption ✓", event_id)
 
@@ -408,8 +427,9 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename="snapshot.jpg",
-                read_timeout=30,
-                write_timeout=30,
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
+                connect_timeout=15,
             )
             logger.info("Event %s → sent photo with caption (GIF unavailable)", event_id)
 
@@ -419,6 +439,8 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 chat_id=TELEGRAM_CHAT_ID,
                 text=caption,
                 parse_mode=ParseMode.HTML,
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
             )
             logger.info("Event %s → sent text only (no media available)", event_id)
 
@@ -449,8 +471,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"",
         f"Notifications: {status_emoji} {'enabled' if state.enabled else 'disabled'}",
         f"Polling interval: {POLLING_INTERVAL}s",
+        f"Upload timeout: {UPLOAD_TIMEOUT}s",
         f"Monitored cameras: {cameras}",
         f"Frigate URL: {FRIGATE_URL}",
+        f"External URL: {EXTERNAL_URL or 'not configured'}",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -509,10 +533,11 @@ async def main() -> None:
 
     logger.info("=== Frigate-Telegram Bot Starting ===")
     logger.info("Frigate URL: %s", FRIGATE_URL)
-    logger.info("External URL: %s", FRIGATE_EXTERNAL_URL)
+    logger.info("External URL: %s", EXTERNAL_URL or "not configured")
     logger.info("Monitor config: %s", MONITOR_CONFIG if MONITOR_CONFIG else "all cameras/zones")
     logger.info("Polling interval: %ds", POLLING_INTERVAL)
     logger.info("Media wait timeout: %ds", MEDIA_WAIT_TIMEOUT)
+    logger.info("Upload timeout: %ds", UPLOAD_TIMEOUT)
     logger.info("Timezone: %s", TIMEZONE)
     logger.info("Debug: %s", DEBUG)
 

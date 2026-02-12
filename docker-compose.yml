@@ -38,11 +38,12 @@ services:
       - MONITOR_CONFIG=front_door:yard,driveway;back_camera:all
 
       # ── Optional ──────────────────────────────────────────────
-      - FRIGATE_EXTERNAL_URL=https://frigate.example.com  # Public URL for clip links (defaults to FRIGATE_URL)
+      - EXTERNAL_URL=https://cctv.example.com            # Public Frigate URL via Cloudflare Tunnel (for event links)
       # - FRIGATE_USERNAME=                            # Basic auth username (if Frigate auth is enabled)
       # - FRIGATE_PASSWORD=                            # Basic auth password
       - POLLING_INTERVAL=60                            # Seconds between polls (default: 60)
       - MEDIA_WAIT_TIMEOUT=5                             # Seconds to wait before fetching media (default: 5)
+      - UPLOAD_TIMEOUT=60                                 # Seconds for Telegram upload timeout (default: 60, increase for slow tunnels)
       - TIMEZONE=UTC                                   # Timezone for timestamps (default: UTC)
       - LOCALES=en-US                                  # Locale for formatting (default: en-US)
       - DEBUG=false                                    # Verbose logging (default: false)
