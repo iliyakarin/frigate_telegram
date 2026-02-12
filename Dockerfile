@@ -1,19 +1,29 @@
-FROM python:3.11-slim
+# Stage 1: Builder
+FROM python:3.11-slim AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-LABEL maintainer="frigate-telegram"
-LABEL description="Frigate event notifications for Telegram"
+# Stage 2: Final Image
+FROM python:3.11-slim
+LABEL maintainer="Iliya Karin"
+LABEL org.opencontainers.image.description="Frigate NVR event notifications for Telegram"
+
+# Non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application
+# Copy only the installed site-packages from the builder
+COPY --from=builder /install /usr/local
 COPY main.py .
 
-# Create data directory for persistent state
-RUN mkdir -p /app/data
+# Create data dir with correct ownership
+RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
-# Run unbuffered for real-time Docker logs
+USER appuser
+
+HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import sys; sys.exit(0)"
+
 CMD ["python", "-u", "main.py"]
