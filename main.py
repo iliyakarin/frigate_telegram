@@ -734,14 +734,14 @@ def authorized_only(func):
 @authorized_only
 async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await state.enable()
-    await update.effective_message.reply_text("✅ Notifications enabled.")
+    await update.effective_chat.send_message("✅ Notifications enabled.")
     logger.info("Notifications enabled via Telegram command.")
 
 
 @authorized_only
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await state.disable()
-    await update.effective_message.reply_text("🔕 Notifications disabled.")
+    await update.effective_chat.send_message("🔕 Notifications disabled.")
     logger.info("Notifications disabled via Telegram command.")
 
 @authorized_only
@@ -769,7 +769,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status - Show bot configuration and health",
         "/help - Show this help message",
     ]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @authorized_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -778,13 +778,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I'll send you rich notifications for Frigate detection events.\n\n"
         "Use the menu below or /help to see available commands."
     )
-    await update.effective_message.reply_text(welcome, reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message(welcome, reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
 
 
 @authorized_only
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the main interaction menu."""
-    await update.effective_message.reply_text("📱 <b>Main Menu</b>", reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message("📱 <b>Main Menu</b>", reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
 
 @authorized_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -804,7 +804,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>Frigate Timeout:</b> ⏳ {FRIGATE_TIMEOUT}s",
         f"<b>Upload Timeout:</b> 📤 {UPLOAD_TIMEOUT}s",
     ]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @authorized_only
@@ -812,14 +812,14 @@ async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     http_client = context.bot_data["http_client"]
     cameras = await fetch_camera_list(http_client)
     if not cameras:
-        await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+        await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
     lines = ["<b>Registered Cameras:</b>", ""]
     for cam in cameras:
         lines.append(f"• <code>{html.escape(cam)}</code>")
 
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 
@@ -986,7 +986,7 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     http_client = context.bot_data["http_client"]
     cameras = await fetch_camera_list(http_client)
     if not cameras:
-        await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+        await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
     await update.effective_chat.send_message(f"🎬 Fetching 30s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
@@ -1030,17 +1030,17 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @authorized_only
 async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.effective_message.reply_text("Usage: /video_last <camera_name>")
+        await update.effective_chat.send_message("Usage: /video_last <camera_name>")
         return
 
     camera_name = " ".join(context.args)
     http_client = context.bot_data["http_client"]
 
-    await update.effective_message.reply_text(f"🎬 Fetching recent event for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message(f"🎬 Fetching recent event for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
 
     events = await fetch_recent_events(http_client, camera_name, limit=5)
     if not events:
-        await update.effective_message.reply_text(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     video_data = None
@@ -1056,11 +1056,11 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning("Could not fetch video for event %s, trying next...", event_id)
 
     if not video_data or not successful_event:
-        await update.effective_message.reply_text(f"❌ Could not fetch video for any of the last {len(events)} events on {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ Could not fetch video for any of the last {len(events)} events on {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     caption = format_caption(successful_event)
-    await update.effective_message.reply_video(
+    await update.effective_chat.send_video(
         video=video_data,
         caption=caption,
         parse_mode=ParseMode.HTML,
@@ -1077,15 +1077,15 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
     http_client = context.bot_data["http_client"]
     cameras = await fetch_camera_list(http_client)
     if not cameras:
-        await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+        await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
-    await update.effective_message.reply_text(f"🎬 Fetching last event clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message(f"🎬 Fetching last event clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
 
     async def fetch_and_send(camera):
         events = await fetch_recent_events(http_client, camera, limit=5)
         if not events:
-            await update.effective_message.reply_text(f"❌ No recent events with clips for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
+            await update.effective_chat.send_message(f"❌ No recent events with clips for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
             return
 
         video_data = None
@@ -1100,7 +1100,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if video_data and successful_event:
             caption = format_caption(successful_event)
-            await update.effective_message.reply_video(
+            await update.effective_chat.send_video(
                 video=video_data,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
@@ -1111,7 +1111,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.effective_message.reply_text(f"❌ Failed to fetch video for any of the last {len(events)} events on <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
+            await update.effective_chat.send_message(f"❌ Failed to fetch video for any of the last {len(events)} events on <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
 
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
