@@ -63,9 +63,11 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
 # Media fetching settings
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
-MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)
-UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)
-SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes", "on")
+FRIGATE_TIMEOUT = int(os.environ.get("FRIGATE_TIMEOUT", "15"))  # seconds for Frigate API requests
+TELEGRAM_CONNECT_TIMEOUT = int(os.environ.get("TELEGRAM_CONNECT_TIMEOUT", "15"))  # seconds for Telegram connection
+MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
+UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "60"))  # seconds for Telegram media upload (tunnel-safe)
+SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes", "on")  # send clip.mp4 instead of preview.gif for HD quality
 
 
 # Media types configuration: { key: (filename, content_type) }
@@ -181,7 +183,7 @@ def _http_auth() -> httpx.BasicAuth | None:
 async def check_frigate_status(client: httpx.AsyncClient) -> bool:
     """Return True if Frigate is reachable."""
     try:
-        resp = await client.get(f"{FRIGATE_URL}/api/version", auth=_http_auth(), timeout=10)
+        resp = await client.get(f"{FRIGATE_URL}/api/version", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         resp.raise_for_status()
         logger.info("Frigate is up — version: %s", resp.text.strip())
         return True
@@ -205,7 +207,7 @@ async def fetch_events(client: httpx.AsyncClient, after_ts: float) -> list[dict]
                 f"{FRIGATE_URL}/api/events",
                 params=params,
                 auth=_http_auth(),
-                timeout=15,
+                timeout=FRIGATE_TIMEOUT,
             )
             resp.raise_for_status()
             events = resp.json()
@@ -250,7 +252,7 @@ async def fetch_media_with_retry(
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = await client.get(url, auth=_http_auth(), timeout=15)
+            resp = await client.get(url, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
 
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -498,7 +500,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 supports_streaming=True,
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=15,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
             logger.info("Event %s → sent HD video clip with caption ✓", event_id)
 
@@ -513,7 +515,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 filename="preview.gif",
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=15,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
             logger.info("Event %s → sent animation with caption ✓", event_id)
 
@@ -527,7 +529,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 filename="snapshot.jpg",
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=15,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
             logger.info("Event %s → sent photo with caption (GIF unavailable)", event_id)
 
@@ -569,6 +571,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"",
         f"Notifications: {status_emoji} {'enabled' if state.enabled else 'disabled'}",
         f"Polling interval: {POLLING_INTERVAL}s",
+        f"Frigate timeout: {FRIGATE_TIMEOUT}s",
         f"Upload timeout: {UPLOAD_TIMEOUT}s",
         f"Monitored cameras: {html.escape(cameras)}",
         f"Frigate URL: {html.escape(FRIGATE_URL)}",
@@ -665,6 +668,8 @@ async def main() -> None:
     logger.info("External URL: %s", EXTERNAL_URL or "not configured")
     logger.info("Monitor config: %s", MONITOR_CONFIG if MONITOR_CONFIG else "all cameras/zones")
     logger.info("Polling interval: %ds", POLLING_INTERVAL)
+    logger.info("Frigate timeout: %ds", FRIGATE_TIMEOUT)
+    logger.info("Telegram connect timeout: %ds", TELEGRAM_CONNECT_TIMEOUT)
     logger.info("Media wait timeout: %ds", MEDIA_WAIT_TIMEOUT)
     logger.info("Upload timeout: %ds", UPLOAD_TIMEOUT)
     logger.info("Send HD clip: %s", SEND_CLIP)
