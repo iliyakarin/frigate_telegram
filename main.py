@@ -68,29 +68,29 @@ if not DEBUG:
 # ─────────────────────── Monitor Config Parser ───────────────────────
 
 
-def parse_monitor_config(raw: str) -> dict[str, list[str]]:
+def parse_monitor_config(raw: str) -> dict[str, set[str]]:
     """Parse MONITOR_CONFIG env var into a camera→zones mapping.
 
     Format:  camera1:zone_a,zone_b;camera2:all
-    Returns: {"camera1": ["zone_a", "zone_b"], "camera2": ["all"]}
+    Returns: {"camera1": {"zone_a", "zone_b"}, "camera2": {"all"}}
 
     If the string is empty, returns an empty dict (= monitor everything).
     """
     if not raw.strip():
         return {}
 
-    config: dict[str, list[str]] = {}
+    config: dict[str, set[str]] = {}
     for entry in raw.split(";"):
         entry = entry.strip()
         if not entry:
             continue
         if ":" in entry:
             camera, zones_str = entry.split(":", 1)
-            zones = [z.strip() for z in zones_str.split(",") if z.strip()]
-            config[camera.strip()] = zones if zones else ["all"]
+            zones = {z.strip() for z in zones_str.split(",") if z.strip()}
+            config[camera.strip()] = zones if zones else {"all"}
         else:
             # Camera name without zones → monitor all zones
-            config[entry.strip()] = ["all"]
+            config[entry.strip()] = {"all"}
     return config
 
 
@@ -166,16 +166,10 @@ async def fetch_events(client: httpx.AsyncClient, after_ts: float) -> list[dict]
     If MONITOR_CONFIG is empty, fetches all cameras without filtering.
     Deduplicates events by ID across cameras.
     """
-    seen_ids: set[str] = set()
-    all_events: list[dict] = []
-
-    cameras = list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else [None]
-
-    for camera in cameras:
+    async def fetch_camera_events(camera: str | None) -> list[dict]:
         params: dict[str, str | float] = {"after": after_ts}
         if camera:
             params["camera"] = camera
-
         try:
             resp = await client.get(
                 f"{FRIGATE_URL}/api/events",
@@ -186,14 +180,23 @@ async def fetch_events(client: httpx.AsyncClient, after_ts: float) -> list[dict]
             resp.raise_for_status()
             events = resp.json()
             logger.debug("Fetched %d events for camera=%s", len(events), camera or "all")
-
-            for ev in events:
-                eid = ev.get("id")
-                if eid and eid not in seen_ids:
-                    seen_ids.add(eid)
-                    all_events.append(ev)
+            return events
         except Exception as exc:
             logger.warning("Error fetching events for camera=%s: %s", camera or "all", exc)
+            return []
+
+    cameras = list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else [None]
+    results = await asyncio.gather(*[fetch_camera_events(c) for c in cameras])
+
+    seen_ids: set[str] = set()
+    all_events: list[dict] = []
+
+    for events in results:
+        for ev in events:
+            eid = ev.get("id")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                all_events.append(ev)
 
     return all_events
 
@@ -305,7 +308,7 @@ def event_matches_config(event: dict) -> bool:
 
     event_zones = event.get("zones", [])
     # Match if any event zone is in the allowed list
-    return bool(set(event_zones) & set(allowed_zones))
+    return not allowed_zones.isdisjoint(event_zones)
 
 
 # ─────────────────────── Caption Formatting ──────────────────────────
