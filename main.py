@@ -573,19 +573,46 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.info("Notifications disabled via Telegram command.")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    status_emoji = "✅" if state.enabled else "🔕"
-    cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "all"
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
-        f"<b>Frigate-Telegram Status</b>",
-        f"",
-        f"Notifications: {status_emoji} {'enabled' if state.enabled else 'disabled'}",
-        f"Polling interval: {POLLING_INTERVAL}s",
-        f"Frigate timeout: {FRIGATE_TIMEOUT}s",
-        f"Upload timeout: {UPLOAD_TIMEOUT}s",
-        f"Monitored cameras: {html.escape(cameras)}",
-        f"Frigate URL: {html.escape(FRIGATE_URL)}",
-        f"External URL: {html.escape(EXTERNAL_URL) if EXTERNAL_URL else 'not configured'}",
+        "<b>Frigate-Telegram Bot Help</b>",
+        "",
+        "🔔 <b>Notifications</b>",
+        "/enable - Turn on alerts",
+        "/disable - Turn off alerts",
+        "",
+        "📊 <b>Information</b>",
+        "/status - Show bot status and configuration",
+        "/help - Show this help message",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    welcome = (
+        "👋 <b>Welcome to Frigate-Telegram!</b>\n\n"
+        "I'll send you rich notifications for Frigate detection events.\n\n"
+        "Use /help to see available commands."
+    )
+    await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status_emoji = "🔔" if state.enabled else "🔕"
+    status_text = "Enabled" if state.enabled else "Disabled"
+    cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "All Cameras"
+    lines = [
+        "📊 <b>Bot Status</b>",
+        "",
+        f"<b>Notifications:</b> {status_emoji} {status_text}",
+        f"<b>Polling Interval:</b> ⏱ {POLLING_INTERVAL}s",
+        f"<b>Monitored Cameras:</b> 🎥 {html.escape(cameras)}",
+        "",
+        "🛠 <b>Configuration</b>",
+        f"<b>Frigate URL:</b> 🔗 {html.escape(FRIGATE_URL)}",
+        f"<b>External URL:</b> 🌐 {html.escape(EXTERNAL_URL) if EXTERNAL_URL else 'Not configured'}",
+        f"<b>Frigate Timeout:</b> ⏳ {FRIGATE_TIMEOUT}s",
+        f"<b>Upload Timeout:</b> 📤 {UPLOAD_TIMEOUT}s",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -688,8 +715,10 @@ async def main() -> None:
 
     # Build the Telegram application with command handlers
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("enable_notifications", cmd_enable))
-    app.add_handler(CommandHandler("disable_notifications", cmd_disable))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler(["enable_notifications", "enable"], cmd_enable))
+    app.add_handler(CommandHandler(["disable_notifications", "disable"], cmd_disable))
     app.add_handler(CommandHandler("status", cmd_status))
 
     async with httpx.AsyncClient() as http_client:

@@ -10,7 +10,7 @@ A Python bot that polls [Frigate NVR](https://frigate.video/) for detection even
 - **Face recognition** — displays recognized names from Frigate's `sub_label` field
 - **Multi-camera matrix** — monitor specific cameras and zones via `MONITOR_CONFIG`
 - **Cloudflare Tunnel support** — `EXTERNAL_URL` for secure public event links
-- **Toggle notifications** — `/enable_notifications`, `/disable_notifications`, `/status` commands
+- **Toggle notifications** — `/enable`, `/disable`, `/status`, and `/help` commands
 - **Persistent state** — notification toggle survives container restarts (JSON file)
 - **Retry logic** — automatically retries media fetches if Frigate hasn't generated them yet
 - **Graceful fallback** — GIF → snapshot → thumbnail → text-only if media isn't available
@@ -157,11 +157,13 @@ No additional configuration is needed — the bot reads `sub_label` directly fro
 
 ## 🤖 Telegram Commands
 
-| Command | Description |
-|---|---|
-| `/enable_notifications` | Turn on event notifications |
-| `/disable_notifications` | Turn off event notifications |
-| `/status` | Show current bot status, polling interval, and monitored cameras |
+| Command | Description | Aliases |
+|---|---|---|
+| `/start` | Show welcome message | — |
+| `/help` | Show available commands | — |
+| `/enable_notifications` | Turn on event notifications | `/enable` |
+| `/disable_notifications` | Turn off event notifications | `/disable` |
+| `/status` | Show bot status and configuration | — |
 
 ## 📦 Docker Compose
 
@@ -226,7 +228,7 @@ If no face is recognized:
 
 🏷️ Name: Person (92%)
 📍 Location: front_door — yard, driveway
-� Time: 2025-01-15 14:32:10 CST
+📅 Time: 2025-01-15 14:32:10 CST
 🕑 End: 2025-01-15 14:32:45 CST
 
 🔗 View Event in Frigate
