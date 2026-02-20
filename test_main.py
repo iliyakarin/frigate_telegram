@@ -133,21 +133,18 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_latest_event(self, mock_auth):
         mock_client = AsyncMock()
         mock_resp = MagicMock()
-        # Mock returns first event incomplete, second complete
-        mock_resp.json.return_value = [
-            {"id": "evt_incomplete", "camera": "cam1", "end_time": None},
-            {"id": "evt_complete", "camera": "cam1", "end_time": 1234567890}
-        ]
+        # Mock returns a list of events
+        mock_resp.json.return_value = [{"id": "event_123", "camera": "cam1"}]
         mock_resp.raise_for_status = MagicMock()
         mock_client.get.return_value = mock_resp
 
         event = await main.fetch_latest_event(mock_client, "cam1")
-        self.assertEqual(event["id"], "evt_complete")
+        self.assertEqual(event["id"], "event_123")
 
         # Verify params
         args, kwargs = mock_client.get.call_args
         self.assertEqual(kwargs["params"]["camera"], "cam1")
-        self.assertEqual(kwargs["params"]["limit"], 10)
+        self.assertEqual(kwargs["params"]["limit"], 1)
         self.assertEqual(kwargs["params"]["has_clip"], 1)
 
     async def test_fetch_recording_clip_url(self):
@@ -263,9 +260,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         """Test cmd_video_last with successful fetch."""
         # Setup context
         update = MagicMock()
-        update.effective_chat.send_message = AsyncMock()
-        update.effective_chat.send_action = AsyncMock()
-        update.effective_chat.send_video = AsyncMock()
+        update.message.reply_text = AsyncMock()
+        update.message.reply_video = AsyncMock()
         
         context = MagicMock()
         context.args = ["garage"]
@@ -289,8 +285,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         # Verify
         mock_fetch_event.assert_called_with(context.bot_data["http_client"], "garage")
-        update.effective_chat.send_action.assert_called_with(main.ChatAction.UPLOAD_VIDEO)
-        update.effective_chat.send_video.assert_called_once()
+        update.message.reply_text.assert_called()
+        update.message.reply_video.assert_called_once()
     
 if __name__ == "__main__":
     unittest.main()
