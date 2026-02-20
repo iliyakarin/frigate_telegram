@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -66,6 +67,13 @@ MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)
 UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)
 SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes", "on")
 
+
+# Media types configuration: { key: (filename, content_type) }
+EVENT_MEDIA_CONFIG = {
+    "gif": ("preview.gif", "image/gif"),
+    "clip": ("clip.mp4", "video/mp4"),
+    "thumbnail": ("thumbnail.jpg", "image/jpeg"),
+}
 
 # ─────────────────────────── Logging ─────────────────────────────────
 
@@ -293,28 +301,42 @@ async def fetch_media_with_retry(
     return None
 
 
-async def fetch_event_gif(client: httpx.AsyncClient, event_id: str) -> bytes | None:
-    """Fetch the preview GIF for an event."""
-    url = f"{FRIGATE_URL}/api/events/{event_id}/preview.gif"
-    return await fetch_media_with_retry(client, url, f"preview.gif for {event_id}", "image/gif")
+async def _fetch_frigate_api(
+    client: httpx.AsyncClient,
+    path: str,
+    label: str,
+    expected_content_type: str | None = None,
+) -> bytes | None:
+    """Internal helper to fetch from Frigate API."""
+    url = f"{FRIGATE_URL}/api/{path}"
+    return await fetch_media_with_retry(client, url, label, expected_content_type)
 
 
-async def fetch_event_clip(client: httpx.AsyncClient, event_id: str) -> bytes | None:
-    """Fetch the clip.mp4 for an event (HD quality video)."""
-    url = f"{FRIGATE_URL}/api/events/{event_id}/clip.mp4"
-    return await fetch_media_with_retry(client, url, f"clip.mp4 for {event_id}", "video/mp4")
+async def fetch_event_media(
+    client: httpx.AsyncClient,
+    event_id: str,
+    media_type: Literal["gif", "clip", "thumbnail"],
+) -> bytes | None:
+    """Fetch event-related media (gif, clip, or thumbnail)."""
+    filename, content_type = EVENT_MEDIA_CONFIG[media_type]
+    return await _fetch_frigate_api(
+        client,
+        f"events/{event_id}/{filename}",
+        f"{filename} for {event_id}",
+        content_type,
+    )
 
 
-async def fetch_event_thumbnail(client: httpx.AsyncClient, event_id: str) -> bytes | None:
-    """Fetch the thumbnail JPEG for an event."""
-    url = f"{FRIGATE_URL}/api/events/{event_id}/thumbnail.jpg"
-    return await fetch_media_with_retry(client, url, f"thumbnail.jpg for {event_id}", "image/jpeg")
 
 
 async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes | None:
     """Fetch the latest snapshot JPEG from a camera."""
-    url = f"{FRIGATE_URL}/api/{camera}/latest.jpg?bbox=1"
-    return await fetch_media_with_retry(client, url, f"latest.jpg for {camera}", "image/jpeg")
+    return await _fetch_frigate_api(
+        client,
+        f"{camera}/latest.jpg?bbox=1",
+        f"latest.jpg for {camera}",
+        "image/jpeg",
+    )
 
 
 # ─────────────────────── Event Filtering ─────────────────────────────
@@ -448,10 +470,14 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
         await asyncio.sleep(MEDIA_WAIT_TIMEOUT)
 
     # ── Fetch all media in parallel ──────────────────────────────────
-    gif_task = asyncio.create_task(fetch_event_gif(http_client, event_id))
-    thumb_task = asyncio.create_task(fetch_event_thumbnail(http_client, event_id))
+    gif_task = asyncio.create_task(fetch_event_media(http_client, event_id, "gif"))
+    thumb_task = asyncio.create_task(fetch_event_media(http_client, event_id, "thumbnail"))
     snap_task = asyncio.create_task(fetch_camera_snapshot(http_client, camera))
-    clip_task = asyncio.create_task(fetch_event_clip(http_client, event_id)) if SEND_CLIP else None
+    clip_task = (
+        asyncio.create_task(fetch_event_media(http_client, event_id, "clip"))
+        if SEND_CLIP
+        else None
+    )
 
     gif_data, thumb_data, snap_data = await asyncio.gather(gif_task, thumb_task, snap_task)
     clip_data = await clip_task if clip_task else None
