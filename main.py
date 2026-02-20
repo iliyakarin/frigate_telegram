@@ -397,22 +397,22 @@ async def fetch_recording_clip(
     client: httpx.AsyncClient, camera: str, start_ts: int, end_ts: int
 ) -> bytes | None:
     """Fetch a recording clip for a specific time range."""
-    # Frigate API: /api/<camera_name>/recordings/start/<start_ts>/end/<end_ts>/clip.mp4
+    # Frigate API: /api/<camera_name>/start/<start_ts>/end/<end_ts>/clip.mp4
     safe_camera = urllib.parse.quote(camera)
     return await _fetch_frigate_api(
         client,
-        f"{safe_camera}/recordings/start/{start_ts}/end/{end_ts}/clip.mp4",
+        f"{safe_camera}/start/{start_ts}/end/{end_ts}/clip.mp4",
         f"clip.mp4 for {camera} ({start_ts}-{end_ts})",
         "video/mp4",
     )
 
 
 async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | None:
-    """Fetch the latest event for a specific camera that has a clip."""
+    """Fetch the latest completed event for a specific camera that has a clip."""
     try:
         params = {
             "camera": camera,
-            "limit": 1,
+            "limit": 10,  # Fetch more to find one that is completed
             "has_clip": 1,
         }
         resp = await client.get(
@@ -424,7 +424,15 @@ async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | N
         resp.raise_for_status()
         events = resp.json()
         if events and isinstance(events, list):
-            return events[0]
+            # Return the first event that has finished (has end_time)
+            for event in events:
+                if event.get("end_time"):
+                    return event
+
+            # Fallback: if no completed event found, return the latest one
+            if events:
+                return events[0]
+
         return None
     except Exception as exc:
         logger.error("Error fetching latest event for %s: %s", camera, exc)
@@ -903,7 +911,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                  end_ts = event_details.get("end_time")
                  if start_ts and end_ts:
                      # Add small buffer to ensure we cover the full duration if slightly misaligned
-                     video_data = await fetch_recording_clip(http_client, camera_name, start_ts, end_ts)
+                     video_data = await fetch_recording_clip(http_client, camera_name, int(start_ts), int(end_ts))
             
             # If still no data, try the rough estimate
             if not video_data:
@@ -968,7 +976,7 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                      s = event_details.get("start_time")
                      e = event_details.get("end_time")
                      if s and e:
-                         data = await fetch_recording_clip(http_client, camera, s, e)
+                         data = await fetch_recording_clip(http_client, camera, int(s), int(e))
             
             # Final fallback
             if not data:

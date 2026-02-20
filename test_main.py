@@ -133,18 +133,38 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_latest_event(self, mock_auth):
         mock_client = AsyncMock()
         mock_resp = MagicMock()
-        mock_resp.json.return_value = [{"id": "event_123", "camera": "cam1"}]
+        # Mock returns first event incomplete, second complete
+        mock_resp.json.return_value = [
+            {"id": "evt_incomplete", "camera": "cam1", "end_time": None},
+            {"id": "evt_complete", "camera": "cam1", "end_time": 1234567890}
+        ]
         mock_resp.raise_for_status = MagicMock()
         mock_client.get.return_value = mock_resp
 
         event = await main.fetch_latest_event(mock_client, "cam1")
-        self.assertEqual(event["id"], "event_123")
+        self.assertEqual(event["id"], "evt_complete")
 
         # Verify params
         args, kwargs = mock_client.get.call_args
         self.assertEqual(kwargs["params"]["camera"], "cam1")
-        self.assertEqual(kwargs["params"]["limit"], 1)
+        self.assertEqual(kwargs["params"]["limit"], 10)
         self.assertEqual(kwargs["params"]["has_clip"], 1)
+
+    async def test_fetch_recording_clip_url(self):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"x" * 150  # > 100 bytes to pass size check
+        mock_client.get.return_value = mock_resp
+
+        await main.fetch_recording_clip(mock_client, "cam1", 1000, 1030)
+
+        args, kwargs = mock_client.get.call_args
+        url = args[0]
+        # Should NOT have /recordings/
+        self.assertNotIn("/recordings/", url)
+        # main.FRIGATE_URL is http://localhost:5000 in test setup
+        self.assertIn("/api/cam1/start/1000/end/1030/clip.mp4", url)
 
     @patch("main.trigger_manual_event")
     @patch("main.fetch_event_media")
