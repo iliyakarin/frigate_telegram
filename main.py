@@ -117,10 +117,14 @@ class NotificationState:
             logger.warning("Could not load state file; defaulting to enabled")
             self._enabled = True
 
-    def _save(self) -> None:
-        try:
+    async def _save(self) -> None:
+        def _do_save():
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.write_text(json.dumps({"enabled": self._enabled}))
+
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _do_save)
         except Exception:
             logger.warning("Could not persist state file")
 
@@ -128,13 +132,13 @@ class NotificationState:
     def enabled(self) -> bool:
         return self._enabled
 
-    def enable(self) -> None:
+    async def enable(self) -> None:
         self._enabled = True
-        self._save()
+        await self._save()
 
-    def disable(self) -> None:
+    async def disable(self) -> None:
         self._enabled = False
-        self._save()
+        await self._save()
 
 
 state = NotificationState(STATE_FILE)
@@ -494,13 +498,13 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 
 
 async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state.enable()
+    await state.enable()
     await update.message.reply_text("✅ Notifications enabled.")
     logger.info("Notifications enabled via Telegram command.")
 
 
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state.disable()
+    await state.disable()
     await update.message.reply_text("🔕 Notifications disabled.")
     logger.info("Notifications disabled via Telegram command.")
 
