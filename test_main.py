@@ -178,17 +178,15 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_media.call_count, 3) 
         mock_media.assert_called_with(context.bot_data["http_client"], "evt_123", "clip")
         
-        # Ensure we sent a video via effective_message
-        effective_message.reply_video.assert_called_once()
+        # Ensure we sent a video via effective_chat
+        update.effective_chat.send_video.assert_called_once()
 
     @patch("main.get_camera_selection_menu")
     async def test_cmd_video_menu(self, mock_get_menu):
         # Setup context
         update = MagicMock()
-        # effective_message used for reply
-        effective_message = MagicMock()
-        effective_message.reply_text = AsyncMock()
-        update.effective_message = effective_message
+        # effective_chat used for reply
+        update.effective_chat.send_message = AsyncMock()
         
         context = MagicMock()
         context.args = [] # No camera arg
@@ -202,8 +200,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
              await main.cmd_video(update, context)
 
         # Verify
-        effective_message.reply_text.assert_called_once()
-        args, kwargs = effective_message.reply_text.call_args
+        update.effective_chat.send_message.assert_called_once()
+        args, kwargs = update.effective_chat.send_message.call_args
         self.assertEqual(kwargs["reply_markup"], mock_menu)
         self.assertIn("Select a camera", args[0])
 
@@ -215,12 +213,11 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         # Setup context
         update = MagicMock()
         update.message = None # Simulating callback
-        # effective_message is used
-        effective_message = MagicMock()
-        effective_message.reply_video = AsyncMock()
-        effective_message.reply_chat_action = AsyncMock()
-        effective_message.reply_text = AsyncMock()
-        update.effective_message = effective_message
+        
+        # effective_chat is used
+        update.effective_chat.send_video = AsyncMock()
+        update.effective_chat.send_action = AsyncMock()
+        update.effective_chat.send_message = AsyncMock()
         
         context = MagicMock()
         context.args = ["garage"] # Button handler sets this
@@ -236,9 +233,9 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         # Verify
         mock_trigger.assert_called_once()
-        effective_message.reply_chat_action.assert_any_call(main.ChatAction.RECORD_VIDEO)
-        effective_message.reply_chat_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
-        effective_message.reply_video.assert_called_once()
+        update.effective_chat.send_action.assert_any_call(main.ChatAction.RECORD_VIDEO)
+        update.effective_chat.send_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
+        update.effective_chat.send_video.assert_called_once()
         
 if __name__ == "__main__":
     unittest.main()

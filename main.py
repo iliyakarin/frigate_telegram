@@ -803,20 +803,20 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "photo")
         if menu:
-            await update.effective_message.reply_text("📸 Select a camera:", reply_markup=menu)
+            await update.effective_chat.send_message("📸 Select a camera:", reply_markup=menu)
         else:
-            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
     
-    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
+    await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
     photo_data = await fetch_camera_snapshot(http_client, camera_name)
     if not photo_data:
-        await update.effective_message.reply_text(f"Could not fetch snapshot for camera: {camera_name}")
+        await update.effective_chat.send_message(f"Could not fetch snapshot for camera: {camera_name}")
         return
 
-    await update.effective_message.reply_photo(
+    await update.effective_chat.send_photo(
         photo=photo_data,
         caption=f"📷 Snapshot: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
@@ -861,22 +861,22 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "video")
         if menu:
-            await update.effective_message.reply_text("🎥 Select a camera to record:", reply_markup=menu)
+            await update.effective_chat.send_message("🎥 Select a camera to record:", reply_markup=menu)
         else:
-            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
 
     duration = 30
-    await update.effective_message.reply_text(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
-    await update.effective_message.reply_chat_action(ChatAction.RECORD_VIDEO)
+    await update.effective_chat.send_message(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_action(ChatAction.RECORD_VIDEO)
 
     # Trigger manual event to force recording
     event_id = await trigger_manual_event(http_client, camera_name, label="telegram_request", duration=duration)
     
     if not event_id:
-        await update.effective_message.reply_text(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     # Wait for recording to complete + buffer
@@ -910,11 +910,11 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              video_data = await fetch_recording_clip(http_client, camera_name, now - (duration + 5), now - 5)
 
     if not video_data:
-        await update.effective_message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
         return
 
-    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
-    await update.effective_message.reply_video(
+    await update.effective_chat.send_action(ChatAction.UPLOAD_VIDEO)
+    await update.effective_chat.send_video(
         video=video_data,
         caption=f"🎬 Clip: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
@@ -995,30 +995,30 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "video_last")
         if menu:
-            await update.effective_message.reply_text("⏮️ Select a camera for last event:", reply_markup=menu)
+            await update.effective_chat.send_message("⏮️ Select a camera for last event:", reply_markup=menu)
         else:
-            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_chat.send_message("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
 
-    await update.effective_message.reply_text(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
-    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
+    await update.effective_chat.send_message(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_action(ChatAction.UPLOAD_VIDEO)
 
     event = await fetch_latest_event(http_client, camera_name)
     if not event:
-        await update.effective_message.reply_text(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     event_id = event.get("id")
     video_data = await fetch_event_media(http_client, event_id, "clip")
 
     if not video_data:
-        await update.effective_message.reply_text(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
+        await update.effective_chat.send_message(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
         return
 
     caption = format_caption(event)
-    await update.effective_message.reply_video(
+    await update.effective_chat.send_video(
         video=video_data,
         caption=caption,
         parse_mode=ParseMode.HTML,
