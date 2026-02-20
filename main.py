@@ -50,12 +50,21 @@ def get_int_setting(key: str, default: int) -> int:
         logger.warning("Invalid value for %s: '%s'. Using default: %s", key, val, default)
         return default
 
+# Helper for safe boolean environment variables
+def get_bool_setting(key: str, default: bool) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
 MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
+
 POLLING_INTERVAL = get_int_setting("POLLING_INTERVAL", 60)
 
 TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 LOCALES = os.environ.get("LOCALES", "en-US")
-DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "1", "yes", "on")
+DEBUG = get_bool_setting("DEBUG", False)
+
 
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
@@ -63,11 +72,12 @@ STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
 # Media fetching settings
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
-FRIGATE_TIMEOUT = int(os.environ.get("FRIGATE_TIMEOUT", "15"))  # seconds for Frigate API requests
-TELEGRAM_CONNECT_TIMEOUT = int(os.environ.get("TELEGRAM_CONNECT_TIMEOUT", "15"))  # seconds for Telegram connection
-MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
-UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "60"))  # seconds for Telegram media upload (tunnel-safe)
-SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes", "on")  # send clip.mp4 instead of preview.gif for HD quality
+FRIGATE_TIMEOUT = get_int_setting("FRIGATE_TIMEOUT", 15)  # seconds for Frigate API requests
+TELEGRAM_CONNECT_TIMEOUT = get_int_setting("TELEGRAM_CONNECT_TIMEOUT", 15)  # seconds for Telegram connection
+MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)  # seconds to wait before fetching media
+UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)  # seconds for Telegram media upload (tunnel-safe)
+SEND_CLIP = get_bool_setting("SEND_CLIP", False)  # send clip.mp4 instead of preview.gif for HD quality
+
 
 
 # Media types configuration: { key: (filename, content_type) }
