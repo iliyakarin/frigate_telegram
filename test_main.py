@@ -237,5 +237,40 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         update.effective_chat.send_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
         update.effective_chat.send_video.assert_called_once()
         
+    @patch("main.fetch_latest_event")
+    @patch("main.fetch_event_media")
+    async def test_cmd_video_last_success(self, mock_media, mock_fetch_event):
+        """Test cmd_video_last with successful fetch."""
+        # Setup context
+        update = MagicMock()
+        update.effective_chat.send_message = AsyncMock()
+        update.effective_chat.send_action = AsyncMock()
+        update.effective_chat.send_video = AsyncMock()
+        
+        context = MagicMock()
+        context.args = ["garage"]
+        context.bot_data = {"http_client": MagicMock()}
+
+        # Mocks
+        mock_fetch_event.return_value = {
+            "id": "evt_last",
+            "camera": "garage",
+            "label": "person",
+            "start_time": 1000,
+            "end_time": 1030,
+            "zones": [],
+            "thumbnail": "thumb"
+        }
+        mock_media.return_value = b"video_bytes"
+
+        with patch("main.TELEGRAM_CHAT_ID", 12345):
+             update.effective_chat.id = 12345
+             await main.cmd_video_last(update, context)
+
+        # Verify
+        mock_fetch_event.assert_called_with(context.bot_data["http_client"], "garage")
+        update.effective_chat.send_action.assert_called_with(main.ChatAction.UPLOAD_VIDEO)
+        update.effective_chat.send_video.assert_called_once()
+    
 if __name__ == "__main__":
     unittest.main()
