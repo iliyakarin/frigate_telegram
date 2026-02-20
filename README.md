@@ -165,8 +165,10 @@ No additional configuration is needed — the bot reads `sub_label` directly fro
 | `/cameras` | List all camera names registered on Frigate |
 | `/photo <camera>` | Get a current snapshot from the specified camera |
 | `/photo_all` | Get current snapshots from all cameras |
-| `/video <camera>` | Get a 15-second video clip from the specified camera |
-| `/video_all` | Get 15-second video clips from all cameras |
+| `/video <camera>` | Get a 30-second video clip from the specified camera |
+| `/video_all` | Get 30-second video clips from all cameras |
+| `/video_last <camera>` | Get the last recorded event clip for the specified camera |
+| `/video_all_last` | Get the last recorded event clips for all cameras |
 
 ## 📦 Docker Compose
 
