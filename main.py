@@ -352,6 +352,33 @@ async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes
     )
 
 
+async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
+    """Fetch the list of camera names from Frigate API."""
+    try:
+        # /api/config contains the full configuration including cameras
+        resp = await client.get(f"{FRIGATE_URL}/api/config", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
+        resp.raise_for_status()
+        config = resp.json()
+        cameras = list(config.get("cameras", {}).keys())
+        return sorted(cameras)
+    except Exception as exc:
+        logger.error("Error fetching camera list: %s", exc)
+        return []
+
+
+async def fetch_recording_clip(
+    client: httpx.AsyncClient, camera: str, start_ts: int, end_ts: int
+) -> bytes | None:
+    """Fetch a recording clip for a specific time range."""
+    # Frigate API: /api/<camera_name>/recordings/start/<start_ts>/end/<end_ts>/clip.mp4
+    return await _fetch_frigate_api(
+        client,
+        f"{camera}/recordings/start/{start_ts}/end/{end_ts}/clip.mp4",
+        f"clip.mp4 for {camera} ({start_ts}-{end_ts})",
+        "video/mp4",
+    )
+
+
 # ─────────────────────── Event Filtering ─────────────────────────────
 
 
@@ -608,6 +635,139 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@authorized_only
+async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+    cameras = await fetch_camera_list(http_client)
+    if not cameras:
+        await update.message.reply_text("Could not retrieve camera list from Frigate.")
+        return
+
+    lines = ["<b>Registered Cameras:</b>", ""]
+    for cam in cameras:
+        lines.append(f"• <code>{html.escape(cam)}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@authorized_only
+async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /photo <camera_name>")
+        return
+
+    camera_name = " ".join(context.args)
+    http_client = context.bot_data["http_client"]
+
+    photo_data = await fetch_camera_snapshot(http_client, camera_name)
+    if not photo_data:
+        await update.message.reply_text(f"Could not fetch snapshot for camera: {camera_name}")
+        return
+
+    await update.message.reply_photo(
+        photo=photo_data,
+        caption=f"📷 Snapshot: {html.escape(camera_name)}",
+        parse_mode=ParseMode.HTML,
+        filename=f"{camera_name}.jpg",
+        read_timeout=UPLOAD_TIMEOUT,
+        write_timeout=UPLOAD_TIMEOUT,
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+    )
+
+
+@authorized_only
+async def cmd_photo_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+    cameras = await fetch_camera_list(http_client)
+    if not cameras:
+        await update.message.reply_text("Could not retrieve camera list from Frigate.")
+        return
+
+    # Fetch and send snapshots
+    async def fetch_and_send(camera):
+        data = await fetch_camera_snapshot(http_client, camera)
+        if data:
+            await update.message.reply_photo(
+                photo=data,
+                caption=f"📷 Snapshot: {html.escape(camera)}",
+                parse_mode=ParseMode.HTML,
+                filename=f"{camera}.jpg",
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed to fetch snapshot for {html.escape(camera)}", parse_mode=ParseMode.HTML)
+
+    await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
+
+
+@authorized_only
+async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /video <camera_name>")
+        return
+
+    camera_name = " ".join(context.args)
+    http_client = context.bot_data["http_client"]
+
+    start_ts = int(time.time())
+    await update.message.reply_text(f"🎬 Recording 15s clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+
+    # Wait for the clip to be recorded plus a small buffer
+    await asyncio.sleep(15 + 2)
+    end_ts = start_ts + 15
+
+    video_data = await fetch_recording_clip(http_client, camera_name, start_ts, end_ts)
+    if not video_data:
+        await update.message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_video(
+        video=video_data,
+        caption=f"🎬 Clip: {html.escape(camera_name)}",
+        parse_mode=ParseMode.HTML,
+        filename=f"{camera_name}.mp4",
+        supports_streaming=True,
+        read_timeout=UPLOAD_TIMEOUT,
+        write_timeout=UPLOAD_TIMEOUT,
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+    )
+
+
+@authorized_only
+async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+    cameras = await fetch_camera_list(http_client)
+    if not cameras:
+        await update.message.reply_text("Could not retrieve camera list from Frigate.")
+        return
+
+    start_ts = int(time.time())
+    await update.message.reply_text(f"🎬 Recording 15s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
+
+    # Wait for the clips to be recorded plus a small buffer
+    await asyncio.sleep(15 + 2)
+    end_ts = start_ts + 15
+
+    # Fetch and send video clips
+    async def fetch_and_send(camera):
+        data = await fetch_recording_clip(http_client, camera, start_ts, end_ts)
+        if data:
+            await update.message.reply_video(
+                video=data,
+                caption=f"🎬 Clip: {html.escape(camera)}",
+                parse_mode=ParseMode.HTML,
+                filename=f"{camera}.mp4",
+                supports_streaming=True,
+                read_timeout=UPLOAD_TIMEOUT,
+                write_timeout=UPLOAD_TIMEOUT,
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed to fetch video clip for {html.escape(camera)}", parse_mode=ParseMode.HTML)
+
+    await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
+
+
 # ─────────────────────── Main Polling Loop ───────────────────────────
 
 
@@ -709,8 +869,16 @@ async def main() -> None:
     app.add_handler(CommandHandler("enable_notifications", cmd_enable))
     app.add_handler(CommandHandler("disable_notifications", cmd_disable))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cameras", cmd_cameras))
+    app.add_handler(CommandHandler("photo", cmd_photo))
+    app.add_handler(CommandHandler("photo_all", cmd_photo_all))
+    app.add_handler(CommandHandler("video", cmd_video))
+    app.add_handler(CommandHandler("video_all", cmd_video_all))
 
     async with httpx.AsyncClient() as http_client:
+        # Store http_client in bot_data for use in command handlers
+        app.bot_data["http_client"] = http_client
+
         # Check Frigate is reachable before starting
         if not await check_frigate_status(http_client):
             logger.error("Frigate is not reachable. Exiting.")

@@ -162,6 +162,11 @@ No additional configuration is needed — the bot reads `sub_label` directly fro
 | `/enable_notifications` | Turn on event notifications |
 | `/disable_notifications` | Turn off event notifications |
 | `/status` | Show current bot status, polling interval, and monitored cameras |
+| `/cameras` | List all camera names registered on Frigate |
+| `/photo <camera>` | Get a current snapshot from the specified camera |
+| `/photo_all` | Get current snapshots from all cameras |
+| `/video <camera>` | Get a 15-second video clip from the specified camera |
+| `/video_all` | Get 15-second video clips from all cameras |
 
 ## 📦 Docker Compose
 
