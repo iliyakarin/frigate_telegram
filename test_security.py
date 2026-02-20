@@ -20,7 +20,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
     def create_mock_update(self, chat_id):
         update = MagicMock()
         update.effective_chat.id = chat_id
-        update.message = AsyncMock()
+        update.effective_chat.send_message = AsyncMock()
         return update
 
     async def test_cmd_enable_unauthorized(self):
@@ -36,7 +36,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
 
         # Verify it remained disabled (FIXED)
         self.assertFalse(main.state.enabled)
-        update.message.reply_text.assert_not_called()
+        update.effective_chat.send_message.assert_not_called()
 
     async def test_cmd_disable_unauthorized(self):
         # Set state to enabled first
@@ -51,7 +51,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
 
         # Verify it remained enabled (FIXED)
         self.assertTrue(main.state.enabled)
-        update.message.reply_text.assert_not_called()
+        update.effective_chat.send_message.assert_not_called()
 
     async def test_cmd_status_unauthorized(self):
         # Unauthorized chat ID
@@ -61,7 +61,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
         await main.cmd_status(update, context)
 
         # Verify it did NOT respond (FIXED)
-        update.message.reply_text.assert_not_called()
+        update.effective_chat.send_message.assert_not_called()
 
     async def test_cmd_enable_authorized(self):
         # Set state to disabled first
@@ -76,7 +76,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
 
         # Verify it WAS enabled
         self.assertTrue(main.state.enabled)
-        update.message.reply_text.assert_called_with("✅ Notifications enabled.")
+        update.effective_chat.send_message.assert_called_with("✅ Notifications enabled.")
 
     async def test_cmd_disable_authorized(self):
         # Set state to enabled first
@@ -91,7 +91,7 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
 
         # Verify it WAS disabled
         self.assertFalse(main.state.enabled)
-        update.message.reply_text.assert_called_with("🔕 Notifications disabled.")
+        update.effective_chat.send_message.assert_called_with("🔕 Notifications disabled.")
 
 if __name__ == "__main__":
     unittest.main()

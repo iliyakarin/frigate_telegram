@@ -306,9 +306,6 @@ async def fetch_media_with_retry(
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY)
                     continue
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
                 return None
 
             # Verify content type if expected
@@ -457,8 +454,11 @@ async def fetch_video_data_robust(
         if event_details:
             s = event_details.get("start_time")
             e = event_details.get("end_time")
-            if s and e:
-                data = await fetch_recording_clip(client, camera, int(s), int(e))
+            if s:
+                # Use provided duration as fallback if end_time hasn't been set yet
+                start_ts = int(s)
+                end_ts = int(e) if e else start_ts + duration
+                data = await fetch_recording_clip(client, camera, start_ts, end_ts)
                 if data:
                     return data
 
@@ -749,7 +749,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "<b>Frigate-Telegram Bot Help</b>",
         "",
-        "� <b>Menu Hub</b>",
+        "📱 <b>Menu Hub</b>",
         "/menu - Open the main interaction menu",
         "",
         "�🔔 <b>Notifications</b>",
@@ -955,8 +955,8 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_chat.send_message(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
             return
 
-        # Wait for recording to complete + buffer
-        await asyncio.sleep(duration + 4)
+        # Wait for recording to complete + buffer (Frigate needs time to finalize segments)
+        await asyncio.sleep(duration + 10)
 
         # Robust fetch
         video_data = await fetch_video_data_robust(http_client, camera_name, event_id, duration)
@@ -1001,7 +1001,8 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.effective_chat.send_message(f"❌ Failed to start recording for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
                 return
 
-            await asyncio.sleep(duration + 5)
+            # Wait for recording to complete + buffer (Frigate needs time to finalize segments)
+            await asyncio.sleep(duration + 10)
 
             # Robust fetch
             data = await fetch_video_data_robust(http_client, camera, event_id, duration)
