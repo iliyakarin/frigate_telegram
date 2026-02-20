@@ -16,14 +16,19 @@ import urllib.parse
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Callable
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Bot, Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram.constants import ParseMode, ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 # Load optional .env file for local development
 load_dotenv()
@@ -298,6 +303,9 @@ async def fetch_media_with_retry(
             # Verify basic response validity
             if len(resp.content) < 100:
                 logger.warning("%s: response too small (%d bytes), retrying", label, len(resp.content))
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY)
                     continue
@@ -709,12 +717,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "🎥 <b>Live View & Media</b>",
         "/cameras - List all registered cameras",
-        "/photo &lt;camera&gt; - Get latest snapshot",
+        "/photo [camera] - Get snapshot (menu if distinct)",
         "/photo_all - Get snapshots from all cameras",
-        "/video &lt;camera&gt; - Record and send 30s clip",
-        "/video_all - Record and send clips from all cameras",
-        "/video_last &lt;camera&gt; - Get last recorded event clip",
-        "/video_all_last - Get last recorded event clips for all cameras",
+        "/video [camera] - Record 30s clip (menu if distinct)",
+        "/video_all - Record 30s clips from all cameras",
+        "/video_last [camera] - Get last event clip (menu if distinct)",
+        "/video_all_last - Get last event clips for all cameras",
         "",
         "📊 <b>Information & Tools</b>",
         "/status - Show bot configuration and health",
@@ -767,15 +775,42 @@ async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+
+async def get_camera_selection_menu(http_client: httpx.AsyncClient, command: str) -> InlineKeyboardMarkup | None:
+    """Create an inline keyboard with buttons for each camera."""
+    cameras = await fetch_camera_list(http_client)
+    if not cameras:
+        return None
+
+    keyboard = []
+    # Create rows of 2 buttons
+    for i in range(0, len(cameras), 2):
+        row = []
+        cam1 = cameras[i]
+        row.append(InlineKeyboardButton(cam1, callback_data=f"cmd:{command}:{cam1}"))
+        if i + 1 < len(cameras):
+            cam2 = cameras[i + 1]
+            row.append(InlineKeyboardButton(cam2, callback_data=f"cmd:{command}:{cam2}"))
+        keyboard.append(row)
+    
+    return InlineKeyboardMarkup(keyboard)
+
+
 @authorized_only
 async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+
     if not context.args:
-        await update.message.reply_text("Usage: /photo <camera_name>")
+        menu = await get_camera_selection_menu(http_client, "photo")
+        if menu:
+            await update.message.reply_text("📸 Select a camera:", reply_markup=menu)
+        else:
+            await update.message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
-    http_client = context.bot_data["http_client"]
-
+    
+    await update.message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
     photo_data = await fetch_camera_snapshot(http_client, camera_name)
     if not photo_data:
         await update.message.reply_text(f"Could not fetch snapshot for camera: {camera_name}")
@@ -821,15 +856,21 @@ async def cmd_photo_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @authorized_only
 async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+
     if not context.args:
-        await update.message.reply_text("Usage: /video <camera_name>")
+        menu = await get_camera_selection_menu(http_client, "video")
+        if menu:
+            await update.message.reply_text("🎥 Select a camera to record:", reply_markup=menu)
+        else:
+            await update.message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
-    http_client = context.bot_data["http_client"]
 
     duration = 30
     await update.message.reply_text(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.message.reply_chat_action(ChatAction.RECORD_VIDEO)
 
     # Trigger manual event to force recording
     event_id = await trigger_manual_event(http_client, camera_name, label="telegram_request", duration=duration)
@@ -839,10 +880,16 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Wait for recording to complete + buffer
-    await asyncio.sleep(duration + 5)
+    # We poll periodically during the wait to keep the bot responsive if needed, but sleep is fine.
+    await asyncio.sleep(duration + 4) # initial wait
 
-    # Fetch the specific event clip
-    video_data = await fetch_event_media(http_client, event_id, "clip")
+    # Retry loop for fetching the clip (Frigate needs time to finalize file)
+    video_data = None
+    for i in range(3):
+        video_data = await fetch_event_media(http_client, event_id, "clip")
+        if video_data:
+             break
+        await asyncio.sleep(2)
     
     if not video_data:
         # Fallback: try time-based fetch if event clip fails (unlikely but safe)
@@ -853,6 +900,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
         return
 
+    await update.message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
     await update.message.reply_video(
         video=video_data,
         caption=f"🎬 Clip: {html.escape(camera_name)}",
@@ -917,14 +965,20 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @authorized_only
 async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    http_client = context.bot_data["http_client"]
+
     if not context.args:
-        await update.message.reply_text("Usage: /video_last <camera_name>")
+        menu = await get_camera_selection_menu(http_client, "video_last")
+        if menu:
+            await update.message.reply_text("⏮️ Select a camera for last event:", reply_markup=menu)
+        else:
+            await update.message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
-    http_client = context.bot_data["http_client"]
 
     await update.message.reply_text(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
 
     event = await fetch_latest_event(http_client, camera_name)
     if not event:
@@ -985,6 +1039,41 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"❌ Failed to fetch last clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
 
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
+
+
+    await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle callback queries from inline keyboards."""
+    query = update.callback_query
+    await query.answer()
+
+    # Data format: cmd:<command>:<camera_name>
+    data = query.data
+    if not data.startswith("cmd:"):
+        return
+
+    try:
+        _, command, camera_name = data.split(":", 2)
+    except ValueError:
+        logger.warning("Invalid callback data: %s", data)
+        return
+
+    # Delete the menu message
+    await query.delete_message()
+
+    # Reuse existing command logic by faking args
+    context.args = [camera_name]
+    
+    if command == "photo":
+        await cmd_photo(update, context)
+    elif command == "video":
+        await cmd_video(update, context)
+    elif command == "video_last":
+        await cmd_video_last(update, context)
+    else:
+        logger.warning("Unknown command in callback: %s", command)
 
 
 # ─────────────────────── Main Polling Loop ───────────────────────────
@@ -1097,6 +1186,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("video_all", cmd_video_all))
     app.add_handler(CommandHandler("video_last", cmd_video_last))
     app.add_handler(CommandHandler("video_all_last", cmd_video_all_last))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     async with httpx.AsyncClient() as http_client:
         # Store http_client in bot_data for use in command handlers

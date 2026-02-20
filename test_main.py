@@ -159,16 +159,62 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         # Mocks
         mock_trigger.return_value = "evt_123"
-        mock_media.return_value = b"video_bytes"
+        # Simulate race condition: 2 failures then success
+        mock_media.side_effect = [None, None, b"video_bytes"]
 
         # Execute
         await main.cmd_video(update, context)
 
         # Verify
         mock_trigger.assert_called_once()
-        mock_media.assert_called_once_with(context.bot_data["http_client"], "evt_123", "clip")
+        # Should be called multiple times due to retry
+        self.assertEqual(mock_media.call_count, 3) 
+        mock_media.assert_called_with(context.bot_data["http_client"], "evt_123", "clip")
+        
         # Ensure we sent a video
         update.message.reply_video.assert_called_once()
+
+    @patch("main.get_camera_selection_menu")
+    async def test_cmd_video_menu(self, mock_get_menu):
+        # Setup context
+        update = MagicMock()
+        # message is a property, so we set it on the instance
+        message_mock = MagicMock()
+        message_mock.reply_text = AsyncMock()
+        update.message = message_mock
+        
+        context = MagicMock()
+        context.args = [] # No camera arg
+        context.bot_data = {"http_client": MagicMock()}
+        
+        mock_menu = MagicMock()
+        mock_get_menu.return_value = mock_menu
+
+        # Bypass authorization decorator by patching it in the module import or extracting logic
+        # Since we import main, the decorator is already applied. We need to simulate the user being authorized.
+        # Check main.py: it likely checks update.effective_user.id against ALLOWED_CHAT_IDS
+        update.effective_user.id = 12345
+        # We need to ensure logic inside authorized_only passes
+        # But wait! I can't easily unwrap it. 
+        # I should have authorized mocked user or patched the config. 
+        # Let's make sure update.effective_user.id is set, and maybe patch ALLOWED_CHAT_IDS if needed.
+        
+        # Actually, let's just make the user ID match what's expected or ensure check passes.
+        # main.py usually loads env vars. 
+        
+        # Better: run the unwrapped function if possible? 
+        # No, let's just mock the authorization check or ensure ID is allowed.
+        # Assuming single user or list. 
+        
+        with patch("main.TELEGRAM_CHAT_ID", 12345):
+             update.effective_chat.id = 12345
+             await main.cmd_video(update, context)
+
+        # Verify
+        message_mock.reply_text.assert_called_once()
+        args, kwargs = message_mock.reply_text.call_args
+        self.assertEqual(kwargs["reply_markup"], mock_menu)
+        self.assertIn("Select a camera", args[0])
         
 if __name__ == "__main__":
     unittest.main()
