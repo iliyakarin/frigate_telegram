@@ -32,10 +32,11 @@ services:
       - TELEGRAM_BOT_TOKEN=your-bot-token-here        # From @BotFather
       - TELEGRAM_CHAT_ID=your-chat-id-here            # Target chat/group ID
 
-      # ── Camera / Zone Matrix ──────────────────────────────────
-      # Format: camera1:zone_a,zone_b;camera2:all
+      # Format (JSON): {"camera1": ["zone_a", "zone_b"], "camera2": ["all"]}
+      # Format (Legacy): camera1:zone_a,zone_b;camera2:all
       # Omit entirely to monitor ALL cameras and zones
-      - MONITOR_CONFIG=front_door:yard,driveway;back_camera:all
+      - MONITOR_CONFIG={"front_door": ["yard", "driveway"], "back_camera": ["all"]}
+
 
       # ── Optional ──────────────────────────────────────────────
       - EXTERNAL_URL=https://cctv.example.com            # Public Frigate URL via Cloudflare Tunnel (for event links)
