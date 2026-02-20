@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -265,6 +266,8 @@ async def fetch_media_with_retry(
         try:
             resp = await client.get(url, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
 
+            if DEBUG:
+                logger.debug("Fetching Frigate API: %s %s", resp.status_code, url)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if resp.status_code == 404:
@@ -272,9 +275,9 @@ async def fetch_media_with_retry(
                 if attempt < MAX_RETRIES:
                     logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, MAX_RETRIES)
                 else:
-                    logger.warning("%s: media not found (404) after %d attempts", label, MAX_RETRIES)
+                    logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, MAX_RETRIES, url)
             else:
-                logger.error("%s: HTTP error %d: %s", label, resp.status_code, exc)
+                logger.error("%s: HTTP error %d: %s. URL: %s", label, resp.status_code, exc, url)
             
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY)
@@ -359,9 +362,10 @@ async def fetch_event_media(
 
 async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes | None:
     """Fetch the latest snapshot JPEG from a camera."""
+    safe_camera = urllib.parse.quote(camera)
     return await _fetch_frigate_api(
         client,
-        f"{camera}/latest.jpg?bbox=1",
+        f"{safe_camera}/latest.jpg?bbox=1",
         f"latest.jpg for {camera}",
         "image/jpeg",
     )
@@ -386,9 +390,10 @@ async def fetch_recording_clip(
 ) -> bytes | None:
     """Fetch a recording clip for a specific time range."""
     # Frigate API: /api/<camera_name>/recordings/start/<start_ts>/end/<end_ts>/clip.mp4
+    safe_camera = urllib.parse.quote(camera)
     return await _fetch_frigate_api(
         client,
-        f"{camera}/recordings/start/{start_ts}/end/{end_ts}/clip.mp4",
+        f"{safe_camera}/recordings/start/{start_ts}/end/{end_ts}/clip.mp4",
         f"clip.mp4 for {camera} ({start_ts}-{end_ts})",
         "video/mp4",
     )
@@ -775,12 +780,13 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     camera_name = " ".join(context.args)
     http_client = context.bot_data["http_client"]
 
-    start_ts = int(time.time())
-    await update.message.reply_text(f"🎬 Recording 15s clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
-
-    # Wait for the clip to be recorded plus a small buffer
-    await asyncio.sleep(15 + 2)
-    end_ts = start_ts + 15
+    # Use a window that is slightly in the past (e.g., 10s ago) 
+    # to ensure Frigate has closed and saved the recording segments.
+    now = int(time.time())
+    start_ts = now - 25  # Start from 25s ago
+    end_ts = now - 10    # Ends at 10s ago (15s duration)
+    
+    await update.message.reply_text(f"🎬 Fetching 15s clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
 
     video_data = await fetch_recording_clip(http_client, camera_name, start_ts, end_ts)
     if not video_data:
@@ -807,12 +813,12 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
-    start_ts = int(time.time())
-    await update.message.reply_text(f"🎬 Recording 15s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
+    # Use a past window (duration: 15s)
+    now = int(time.time())
+    start_ts = now - 25 
+    end_ts = now - 10
 
-    # Wait for the clips to be recorded plus a small buffer
-    await asyncio.sleep(15 + 2)
-    end_ts = start_ts + 15
+    await update.message.reply_text(f"🎬 Fetching 15s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
 
     # Fetch and send video clips
     async def fetch_and_send(camera):
