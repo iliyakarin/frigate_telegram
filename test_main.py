@@ -129,5 +129,22 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         call_args = bot.send_animation.call_args
         self.assertIn("Found", call_args.kwargs["caption"])
 
+    @patch("main._http_auth")
+    async def test_fetch_latest_event(self, mock_auth):
+        mock_client = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [{"id": "event_123", "camera": "cam1"}]
+        mock_resp.raise_for_status = MagicMock()
+        mock_client.get.return_value = mock_resp
+
+        event = await main.fetch_latest_event(mock_client, "cam1")
+        self.assertEqual(event["id"], "event_123")
+
+        # Verify params
+        args, kwargs = mock_client.get.call_args
+        self.assertEqual(kwargs["params"]["camera"], "cam1")
+        self.assertEqual(kwargs["params"]["limit"], 1)
+        self.assertEqual(kwargs["params"]["has_clip"], 1)
+
 if __name__ == "__main__":
     unittest.main()
