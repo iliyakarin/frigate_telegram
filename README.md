@@ -166,8 +166,8 @@ No additional configuration is needed — the bot reads `sub_label` directly fro
 | `/menu` | Open the main interaction menu dashboard |
 | `/photo [camera]` | Get a snapshot |
 | `/photo_all` | Get current snapshots from all cameras |
-| `/video [camera]` | Get 30s manual recording |
-| `/video_all` | Get 30s manual recording from all cameras |
+| `/video [camera]` | Get 30s manual recording (requires server-side continuous recording enabled) |
+| `/video_all` | Get 30s manual recording from all cameras (requires server-side continuous recording enabled) |
 | `/video_last [camera]` | Get last event clip |
 | `/video_all_last` | Get last event clips for all cameras |
 

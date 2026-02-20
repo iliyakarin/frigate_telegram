@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
@@ -752,7 +752,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📱 <b>Menu Hub</b>",
         "/menu - Open the main interaction menu",
         "",
-        "�🔔 <b>Notifications</b>",
+        "🔔 <b>Notifications</b>",
         "/enable - Turn on event alerts",
         "/disable - Turn off event alerts",
         "",
@@ -760,8 +760,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cameras - List all registered cameras",
         "/photo [camera] - Get snapshot",
         "/photo_all - Get snapshots from all cameras",
-        "/video [camera] - Record 30s clip",
-        "/video_all - Record 30s clips from all cameras",
+        "/video [camera] - Record 30s manual clip (requires server-side continuous recording)",
+        "/video_all - Record 30s clips from all cameras (requires server-side continuous recording)",
         "/video_last [camera] - Get last event clip",
         "/video_all_last - Get last event clips for all cameras",
         "",
@@ -838,7 +838,8 @@ async def get_main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "🔔 Notifications: ON" if state.enabled else "🔕 Notifications: OFF",
                 callback_data="toggle:notifications"
-            )
+            ),
+            InlineKeyboardButton("❓ Help", callback_data="nav:help"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1144,6 +1145,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif target == "video_last":
             menu = await get_camera_selection_menu(http_client, "video_last", include_all=True)
             await query.edit_message_text("⏮️ <b>Latest Activity</b>\nSelect a camera to see the last recorded event:", reply_markup=menu, parse_mode=ParseMode.HTML)
+        elif target == "help":
+            await cmd_help(update, context)
         return
 
     # 2. Toggle handling
@@ -1318,6 +1321,24 @@ async def main() -> None:
 
         # Initialize the Telegram application and start command polling
         await app.initialize()
+
+        # Set command suggestions (autocomplete)
+        commands = [
+            BotCommand("menu", "Open the main interaction menu"),
+            BotCommand("status", "Show bot configuration and health"),
+            BotCommand("cameras", "List all registered cameras"),
+            BotCommand("photo", "Get snapshot from a camera"),
+            BotCommand("photo_all", "Get snapshots from all cameras"),
+            BotCommand("video", "Record 30s manual clip"),
+            BotCommand("video_all", "Record 30s clips from all cameras"),
+            BotCommand("video_last", "Get last recorded event clip"),
+            BotCommand("video_all_last", "Get last recorded clips for all cameras"),
+            BotCommand("enable", "Turn on event alerts"),
+            BotCommand("disable", "Turn off event alerts"),
+            BotCommand("help", "Show help message"),
+        ]
+        await app.bot.set_my_commands(commands)
+
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
