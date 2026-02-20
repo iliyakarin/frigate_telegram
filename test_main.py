@@ -254,9 +254,38 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         update.effective_chat.send_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
         update.effective_chat.send_video.assert_called_once()
         
-    @patch("main.fetch_latest_event")
     @patch("main.fetch_event_media")
-    async def test_cmd_video_last_success(self, mock_media, mock_fetch_event):
+    @patch("main.fetch_event_details")
+    @patch("main.fetch_recording_clip")
+    @patch("asyncio.sleep", return_value=None)
+    async def test_fetch_video_data_robust_fallbacks(self, mock_sleep, mock_recording, mock_details, mock_media):
+        """Test fetch_video_data_robust fallback chain."""
+        client = MagicMock()
+        
+        # Scenario 1: Pre-generated clip success
+        mock_media.return_value = b"event_clip"
+        data = await main.fetch_video_data_robust(client, "cam1", "evt1")
+        self.assertEqual(data, b"event_clip")
+        mock_media.assert_called()
+        
+        # Scenario 2: Pre-generated clip fails, precise recording success
+        mock_media.return_value = None
+        mock_details.return_value = {"start_time": 100, "end_time": 130}
+        mock_recording.return_value = b"precise_clip"
+        data = await main.fetch_video_data_robust(client, "cam1", "evt1")
+        self.assertEqual(data, b"precise_clip")
+        mock_recording.assert_any_call(client, "cam1", 100, 130)
+        
+        # Scenario 3: Everything fails, rough recording fallback
+        mock_media.return_value = None
+        mock_details.return_value = None
+        mock_recording.return_value = b"rough_clip"
+        data = await main.fetch_video_data_robust(client, "cam1", "evt1")
+        self.assertEqual(data, b"rough_clip")
+
+    @patch("main.fetch_latest_event")
+    @patch("main.fetch_video_data_robust")
+    async def test_cmd_video_last_success(self, mock_robust, mock_fetch_event):
         """Test cmd_video_last with successful fetch."""
         # Setup context
         update = MagicMock()
@@ -277,7 +306,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
             "zones": [],
             "thumbnail": "thumb"
         }
-        mock_media.return_value = b"video_bytes"
+        mock_robust.return_value = b"video_bytes"
 
         with patch("main.TELEGRAM_CHAT_ID", 12345):
              update.effective_chat.id = 12345

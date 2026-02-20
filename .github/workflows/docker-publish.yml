@@ -8,6 +8,12 @@ on:
       - 'README.md'
       - '.env.example'
       - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (only ignored on main branch)'
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -27,6 +33,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run tests
+        if: github.ref_name == 'main' || github.event.inputs.skip_tests != 'true'
         run: python3 test_main.py
 
   publish:
@@ -76,15 +83,33 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Prepare Docker tags
+        id: prep
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "tag_latest=latest" >> $GITHUB_OUTPUT
+            echo "tag_version=${{ steps.tag_version.outputs.new_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag_latest=dev" >> $GITHUB_OUTPUT
+            # Use branch name if version tag is empty
+            TAG_VER="${{ steps.tag_version.outputs.new_tag }}"
+            if [ -z "$TAG_VER" ]; then
+              TAG_VER="${{ github.ref_name }}"
+            fi
+            # Sanitize tag name (replace / with - and other common issues)
+            SAFE_TAG=$(echo "$TAG_VER" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            echo "tag_version=${SAFE_TAG}-dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ env.REPO_OWNER }}/frigate-telegram:latest
-            ghcr.io/${{ env.REPO_OWNER }}/frigate-telegram:${{ steps.tag_version.outputs.new_tag }}
-            iliyakarin/frigate-telegram:latest
-            iliyakarin/frigate-telegram:${{ steps.tag_version.outputs.new_tag }}
+            ghcr.io/${{ env.REPO_OWNER }}/frigate-telegram:${{ steps.prep.outputs.tag_latest }}
+            ghcr.io/${{ env.REPO_OWNER }}/frigate-telegram:${{ steps.prep.outputs.tag_version }}
+            iliyakarin/frigate-telegram:${{ steps.prep.outputs.tag_latest }}
+            iliyakarin/frigate-telegram:${{ steps.prep.outputs.tag_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

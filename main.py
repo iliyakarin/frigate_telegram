@@ -431,6 +431,44 @@ async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | N
         return None
 
 
+async def fetch_video_data_robust(
+    client: httpx.AsyncClient, camera: str, event_id: str | None = None, duration: int = 30
+) -> bytes | None:
+    """
+    Robustly fetch video data by trying:
+    1. Pre-generated event clip (with retries for new events)
+    2. Precise recording clip using event start/end times
+    3. Rough recording clip using current time or duration
+    """
+    data = None
+
+    # 1. Try pre-generated event clip
+    if event_id:
+        # Retry loop for new events that might still be processing
+        for i in range(5):
+            data = await fetch_event_media(client, event_id, "clip")
+            if data:
+                return data
+            await asyncio.sleep(2)
+
+        # 2. Try precise recording clip using event times
+        logger.info("Event clip not found for %s, trying precise recording fallback...", event_id)
+        event_details = await fetch_event_details(client, event_id)
+        if event_details:
+            s = event_details.get("start_time")
+            e = event_details.get("end_time")
+            if s and e:
+                data = await fetch_recording_clip(client, camera, int(s), int(e))
+                if data:
+                    return data
+
+    # 3. Final fallback: Rough recording clip
+    logger.info("Falling back to rough recording clip for %s (%ds)...", camera, duration)
+    now = int(time.time())
+    data = await fetch_recording_clip(client, camera, now - (duration + 5), now - 5)
+    return data
+
+
 async def trigger_manual_event(
     client: httpx.AsyncClient, camera: str, label: str = "manual", duration: int = 30
 ) -> str | None:
@@ -881,37 +919,13 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # Wait for recording to complete + buffer
-        # We poll periodically during the wait to keep the bot responsive if needed, but sleep is fine.
-        await asyncio.sleep(duration + 4) # initial wait
+        await asyncio.sleep(duration + 4)
 
-        # Retry loop for fetching the clip (Frigate needs time to finalize file)
-        video_data = None
-        # Retry up to 10 times (20 seconds) because Frigate export can be slow
-        for i in range(10):
-            video_data = await fetch_event_media(http_client, event_id, "clip")
-            if video_data:
-                 break
-            await asyncio.sleep(2)
+        # Robust fetch
+        video_data = await fetch_video_data_robust(http_client, camera_name, event_id, duration)
         
         if not video_data:
-            # Fallback: try time-based fetch using precise event times
-            logger.warning("Event clip fetch failed for %s, trying fallback with recording segments.", event_id)
-            event_details = await fetch_event_details(http_client, event_id)
-            
-            if event_details:
-                 start_ts = event_details.get("start_time")
-                 end_ts = event_details.get("end_time")
-                 if start_ts and end_ts:
-                     # Add small buffer to ensure we cover the full duration if slightly misaligned
-                     video_data = await fetch_recording_clip(http_client, camera_name, int(start_ts), int(end_ts))
-            
-            # If still no data, try the rough estimate
-            if not video_data:
-                 now = int(time.time())
-                 video_data = await fetch_recording_clip(http_client, camera_name, now - (duration + 5), now - 5)
-
-        if not video_data:
-            await update.effective_chat.send_message(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
+            await update.effective_chat.send_message(f"❌ Could not fetch video clip for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
             return
 
         await update.effective_chat.send_action(ChatAction.UPLOAD_VIDEO)
@@ -919,7 +933,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             video=video_data,
             caption=f"🎬 Clip: {html.escape(camera_name)}",
             parse_mode=ParseMode.HTML,
-            filename=f"{camera_name}_{event_id}.mp4",
+            filename=f"{camera_name}_{event_id if event_id else 'manual'}.mp4",
             supports_streaming=True,
             read_timeout=UPLOAD_TIMEOUT,
             write_timeout=UPLOAD_TIMEOUT,
@@ -950,30 +964,10 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.effective_chat.send_message(f"❌ Failed to start recording for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
                 return
 
-            # Wait handled outside loop to be concurrent
             await asyncio.sleep(duration + 5)
 
-            # Retry loop for event clip
-            data = None
-            for _ in range(10):
-                data = await fetch_event_media(http_client, event_id, "clip")
-                if data:
-                    break
-                await asyncio.sleep(2)
-
-            # Fallback to precise recording clip
-            if not data:
-                 event_details = await fetch_event_details(http_client, event_id)
-                 if event_details:
-                     s = event_details.get("start_time")
-                     e = event_details.get("end_time")
-                     if s and e:
-                         data = await fetch_recording_clip(http_client, camera, int(s), int(e))
-            
-            # Final fallback
-            if not data:
-                 now = int(time.time())
-                 data = await fetch_recording_clip(http_client, camera, now - (duration + 5), now - 5)
+            # Robust fetch
+            data = await fetch_video_data_robust(http_client, camera, event_id, duration)
 
             if data:
                 await update.effective_chat.send_video(
@@ -1013,7 +1007,8 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     event_id = event.get("id")
-    video_data = await fetch_event_media(http_client, event_id, "clip")
+    # Robust fetch with no wait (event is old) but with recording fallback
+    video_data = await fetch_video_data_robust(http_client, camera_name, event_id)
 
     if not video_data:
         await update.message.reply_text(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
@@ -1049,7 +1044,9 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         event_id = event.get("id")
-        data = await fetch_event_media(http_client, event_id, "clip")
+        # Robust fetch
+        data = await fetch_video_data_robust(http_client, camera, event_id)
+        
         if data:
             caption = format_caption(event)
             await update.message.reply_video(
