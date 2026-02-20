@@ -66,18 +66,24 @@ To monitor all cameras and zones, just comment out (or omit) the `MONITOR_CONFIG
 
 Or use `MONITOR_CONFIG` to define **which cameras and zones** to watch with a simple semicolon-separated syntax:
 
+```bash
+# JSON format (preferred)
+MONITOR_CONFIG='{"camera1": ["zone_a", "zone_b"], "camera2": ["all"]}'
+
+# Legacy semicolon format (still supported)
+MONITOR_CONFIG=camera1:zone_a,zone_b;camera2:all
 ```
-MONITOR_CONFIG=camera1:zone_a,zone_b;camera2:all;camera3:driveway
-```
+
 
 ### Syntax
 
 | Format | Meaning |
 |---|---|
-| `camera1:zone_a,zone_b` | Monitor `camera1`, only in `zone_a` and `zone_b` |
-| `camera2:all` | Monitor `camera2` in **all zones** |
-| `camera3` | Same as `camera3:all` |
-| *(empty / omitted)* | Monitor **all cameras** and **all zones** |
+| `'{"cam": ["z1"]}'` | (JSON) Monitor `cam` in `z1` |
+| `cam:z1,z2` | (Legacy) Monitor `cam` in `z1` and `z2` |
+| `cam:all` | Monitor `cam` in **all zones** |
+| *(empty)* | Monitor **all cameras/all zones** |
+
 
 ### Examples
 
@@ -170,12 +176,13 @@ services:
       - EXTERNAL_URL=https://cctv.yourdomain.com
       - TELEGRAM_BOT_TOKEN=123456:ABC-DEF
       - TELEGRAM_CHAT_ID=-1001234567890
-      - MONITOR_CONFIG=front_door:yard,driveway;back_camera:all
+      - MONITOR_CONFIG={"front_door": ["yard", "driveway"], "back_camera": ["all"]}
       - POLLING_INTERVAL=60
       - MEDIA_WAIT_TIMEOUT=5
       - UPLOAD_TIMEOUT=60
       - TIMEZONE=America/Chicago
       - DEBUG=false
+
     volumes:
       - frigate-telegram-data:/app/data
 

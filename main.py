@@ -17,9 +17,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+from dotenv import load_dotenv
 from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+# Load optional .env file for local development
+load_dotenv()
+
 
 # ─────────────────────────── Configuration ───────────────────────────
 
@@ -33,21 +38,34 @@ EXTERNAL_URL = os.environ.get("EXTERNAL_URL", "").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Helper for safe integer environment variables with validation
+def get_int_setting(key: str, default: int) -> int:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning("Invalid value for %s: '%s'. Using default: %s", key, val, default)
+        return default
+
 MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
-POLLING_INTERVAL = int(os.environ.get("POLLING_INTERVAL", "60"))
+POLLING_INTERVAL = get_int_setting("POLLING_INTERVAL", 60)
 
 TIMEZONE = os.environ.get("TIMEZONE", "UTC")
 LOCALES = os.environ.get("LOCALES", "en-US")
-DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "1", "yes")
+DEBUG = os.environ.get("DEBUG", "false").lower() in ("true", "1", "yes", "on")
+
 
 STATE_FILE = Path(os.environ.get("STATE_FILE", "/app/data/state.json"))
 
 # Media fetching settings
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
-MEDIA_WAIT_TIMEOUT = int(os.environ.get("MEDIA_WAIT_TIMEOUT", "5"))  # seconds to wait before fetching media
-UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "60"))  # seconds for Telegram media upload (tunnel-safe)
-SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes")  # send clip.mp4 instead of preview.gif for HD quality
+MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)
+UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)
+SEND_CLIP = os.environ.get("SEND_CLIP", "false").lower() in ("true", "1", "yes", "on")
+
 
 # ─────────────────────────── Logging ─────────────────────────────────
 
@@ -222,44 +240,52 @@ async def fetch_media_with_retry(
         try:
             resp = await client.get(url, auth=_http_auth(), timeout=15)
 
-            # 404 means Frigate hasn't generated the media yet — retry
-            if resp.status_code == 404:
-                raise httpx.HTTPStatusError(
-                    f"404 Not Found (media not ready)",
-                    request=resp.request,
-                    response=resp,
-                )
-
             resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if resp.status_code == 404:
+                # 404 means Frigate hasn't generated the media yet — retry
+                if attempt < MAX_RETRIES:
+                    logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, MAX_RETRIES)
+                else:
+                    logger.warning("%s: media not found (404) after %d attempts", label, MAX_RETRIES)
+            else:
+                logger.error("%s: HTTP error %d: %s", label, resp.status_code, exc)
+            
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            return None
+        except httpx.RequestError as exc:
+            logger.error("%s: Network error: %s", label, exc)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY)
+                continue
+            return None
+        except Exception as exc:
+            logger.error("%s: Unexpected error fetching %s: %s", label, url, exc)
+            return None
 
-            # Verify content type if expected
-            ct = resp.headers.get("content-type", "")
-            if expected_content_type and expected_content_type not in ct:
-                logger.warning(
-                    "%s: expected Content-Type containing '%s', got '%s'",
-                    label, expected_content_type, ct,
-                )
-
-            # Reject empty responses
+        # Success path
+        try:
+            # Verify basic response validity
             if len(resp.content) < 100:
                 logger.warning("%s: response too small (%d bytes), retrying", label, len(resp.content))
-                raise ValueError(f"Response too small: {len(resp.content)} bytes")
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
+                return None
 
-            logger.debug("Fetched %s (attempt %d, %d bytes, %s)", label, attempt, len(resp.content), ct)
+            # Verify content type if expected
+            ct = resp.headers.get("content-type", "").lower()
+            if expected_content_type and expected_content_type.lower() not in ct:
+                logger.warning("%s: expected %s, got %s", label, expected_content_type, ct)
+
+            logger.debug("Fetched %s: %d bytes", label, len(resp.content))
             return resp.content
-
         except Exception as exc:
-            if attempt < MAX_RETRIES:
-                logger.warning(
-                    "Failed to fetch %s (attempt %d/%d): %s — retrying in %ds",
-                    label, attempt, MAX_RETRIES, exc, RETRY_DELAY,
-                )
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                logger.error(
-                    "Failed to fetch %s after %d attempts: %s",
-                    label, MAX_RETRIES, exc,
-                )
+            logger.error("%s: Error processing response: %s", label, exc)
+            return None
+
     return None
 
 
@@ -525,11 +551,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
-    """Continuously poll Frigate for new events and send notifications."""
+    """Continuously poll Frigate for new events and send notifications.
+    
+    Implements a back-off strategy if Frigate is unreachable.
+    """
     last_poll_ts = time.time()
+    current_interval = POLLING_INTERVAL
+    frigate_online = True
+
     logger.info(
         "Polling started — interval=%ds, cameras=%s",
-        POLLING_INTERVAL,
+        current_interval,
         list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "all",
     )
 
@@ -537,24 +569,49 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
         try:
             if state.enabled:
                 poll_after = last_poll_ts
-                last_poll_ts = time.time()
+                
+                try:
+                    events = await fetch_events(http_client, poll_after)
+                    
+                    # Recovery logic
+                    if not frigate_online:
+                        logger.info("Frigate is back online! Resuming normal polling.")
+                        frigate_online = True
+                        current_interval = POLLING_INTERVAL
 
-                events = await fetch_events(http_client, poll_after)
-                matched = [ev for ev in events if event_matches_config(ev)]
+                    last_poll_ts = time.time()
+                    matched = [ev for ev in events if event_matches_config(ev)]
 
-                if matched:
-                    logger.info("Processing %d new event(s)", len(matched))
-                    for event in matched:
-                        await send_event_notification(bot, event, http_client)
-                    logger.info("All events processed.")
-                else:
-                    logger.debug("No new matching events.")
+                    if matched:
+                        logger.info("Processing %d new event(s)", len(matched))
+                        for event in matched:
+                            try:
+                                await send_event_notification(bot, event, http_client)
+                            except Exception as e:
+                                logger.error("Fatal error processing event notification: %s", e)
+                        logger.info("All events processed.")
+                    else:
+                        logger.debug("No new matching events.")
+                
+                except (httpx.NetworkError, httpx.TimeoutException) as exc:
+                    if frigate_online:
+                        logger.error("Frigate connection lost: %s. Entering back-off mode.", exc)
+                        frigate_online = False
+                    
+                    # Simple linear back-off: increase interval but stay responsive
+                    current_interval = min(current_interval + 60, 300) 
+                    logger.debug("Frigate unreachable, retrying in %ds", current_interval)
+                
+                except Exception as exc:
+                    logger.error("Unexpected error in polling loop: %s", exc, exc_info=DEBUG)
             else:
                 logger.debug("Notifications disabled — skipping poll.")
+                current_interval = POLLING_INTERVAL # Reset interval while disabled
         except Exception as exc:
-            logger.error("Error in polling loop: %s", exc, exc_info=DEBUG)
+            logger.error("Critical failure in polling loop: %s", exc, exc_info=True)
 
-        await asyncio.sleep(POLLING_INTERVAL)
+        await asyncio.sleep(current_interval)
+
 
 
 # ─────────────────────────── Entrypoint ──────────────────────────────
