@@ -764,9 +764,10 @@ async def cmd_photo_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 filename=f"{camera}.jpg",
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.message.reply_text(f"❌ Failed to fetch snapshot for {html.escape(camera)}", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"❌ Failed to fetch snapshot for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
 
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
@@ -832,9 +833,10 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 supports_streaming=True,
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.message.reply_text(f"❌ Failed to fetch video clip for {html.escape(camera)}", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
 
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
