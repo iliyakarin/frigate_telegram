@@ -153,6 +153,10 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         # Setup context
         update = AsyncMock()
         update.effective_chat.id = "fake"
+        # main.py now uses effective_message
+        effective_message = AsyncMock()
+        update.effective_message = effective_message
+        
         context = MagicMock()
         context.args = ["garage"]
         context.bot_data = {"http_client": MagicMock()}
@@ -161,9 +165,12 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_trigger.return_value = "evt_123"
         # Simulate race condition: 2 failures then success
         mock_media.side_effect = [None, None, b"video_bytes"]
-
-        # Execute
-        await main.cmd_video(update, context)
+        
+        # Bypass authorized_only
+        with patch("main.TELEGRAM_CHAT_ID", "fake"): 
+            update.effective_user.id = "fake"
+            update.effective_chat.id = "fake"
+            await main.cmd_video(update, context)
 
         # Verify
         mock_trigger.assert_called_once()
@@ -171,17 +178,17 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_media.call_count, 3) 
         mock_media.assert_called_with(context.bot_data["http_client"], "evt_123", "clip")
         
-        # Ensure we sent a video
-        update.message.reply_video.assert_called_once()
+        # Ensure we sent a video via effective_message
+        effective_message.reply_video.assert_called_once()
 
     @patch("main.get_camera_selection_menu")
     async def test_cmd_video_menu(self, mock_get_menu):
         # Setup context
         update = MagicMock()
-        # message is a property, so we set it on the instance
-        message_mock = MagicMock()
-        message_mock.reply_text = AsyncMock()
-        update.message = message_mock
+        # effective_message used for reply
+        effective_message = MagicMock()
+        effective_message.reply_text = AsyncMock()
+        update.effective_message = effective_message
         
         context = MagicMock()
         context.args = [] # No camera arg
@@ -190,31 +197,48 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_menu = MagicMock()
         mock_get_menu.return_value = mock_menu
 
-        # Bypass authorization decorator by patching it in the module import or extracting logic
-        # Since we import main, the decorator is already applied. We need to simulate the user being authorized.
-        # Check main.py: it likely checks update.effective_user.id against ALLOWED_CHAT_IDS
-        update.effective_user.id = 12345
-        # We need to ensure logic inside authorized_only passes
-        # But wait! I can't easily unwrap it. 
-        # I should have authorized mocked user or patched the config. 
-        # Let's make sure update.effective_user.id is set, and maybe patch ALLOWED_CHAT_IDS if needed.
-        
-        # Actually, let's just make the user ID match what's expected or ensure check passes.
-        # main.py usually loads env vars. 
-        
-        # Better: run the unwrapped function if possible? 
-        # No, let's just mock the authorization check or ensure ID is allowed.
-        # Assuming single user or list. 
-        
         with patch("main.TELEGRAM_CHAT_ID", 12345):
              update.effective_chat.id = 12345
              await main.cmd_video(update, context)
 
         # Verify
-        message_mock.reply_text.assert_called_once()
-        args, kwargs = message_mock.reply_text.call_args
+        effective_message.reply_text.assert_called_once()
+        args, kwargs = effective_message.reply_text.call_args
         self.assertEqual(kwargs["reply_markup"], mock_menu)
         self.assertIn("Select a camera", args[0])
+
+    @patch("main.trigger_manual_event")
+    @patch("main.fetch_event_media")
+    @patch("asyncio.sleep")
+    async def test_cmd_video_callback(self, mock_sleep, mock_media, mock_trigger):
+        """Test cmd_video when triggered by a callback (update.message is None)."""
+        # Setup context
+        update = MagicMock()
+        update.message = None # Simulating callback
+        # effective_message is used
+        effective_message = MagicMock()
+        effective_message.reply_video = AsyncMock()
+        effective_message.reply_chat_action = AsyncMock()
+        effective_message.reply_text = AsyncMock()
+        update.effective_message = effective_message
+        
+        context = MagicMock()
+        context.args = ["garage"] # Button handler sets this
+        context.bot_data = {"http_client": MagicMock()}
+
+        # Mocks
+        mock_trigger.return_value = "evt_callback"
+        mock_media.return_value = b"video_bytes"
+
+        with patch("main.TELEGRAM_CHAT_ID", 12345):
+             update.effective_chat.id = 12345
+             await main.cmd_video(update, context)
+
+        # Verify
+        mock_trigger.assert_called_once()
+        effective_message.reply_chat_action.assert_any_call(main.ChatAction.RECORD_VIDEO)
+        effective_message.reply_chat_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
+        effective_message.reply_video.assert_called_once()
         
 if __name__ == "__main__":
     unittest.main()

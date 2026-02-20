@@ -803,20 +803,20 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "photo")
         if menu:
-            await update.message.reply_text("📸 Select a camera:", reply_markup=menu)
+            await update.effective_message.reply_text("📸 Select a camera:", reply_markup=menu)
         else:
-            await update.message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
     
-    await update.message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
+    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
     photo_data = await fetch_camera_snapshot(http_client, camera_name)
     if not photo_data:
-        await update.message.reply_text(f"Could not fetch snapshot for camera: {camera_name}")
+        await update.effective_message.reply_text(f"Could not fetch snapshot for camera: {camera_name}")
         return
 
-    await update.message.reply_photo(
+    await update.effective_message.reply_photo(
         photo=photo_data,
         caption=f"📷 Snapshot: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
@@ -861,22 +861,22 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "video")
         if menu:
-            await update.message.reply_text("🎥 Select a camera to record:", reply_markup=menu)
+            await update.effective_message.reply_text("🎥 Select a camera to record:", reply_markup=menu)
         else:
-            await update.message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
 
     duration = 30
-    await update.message.reply_text(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
-    await update.message.reply_chat_action(ChatAction.RECORD_VIDEO)
+    await update.effective_message.reply_text(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_chat_action(ChatAction.RECORD_VIDEO)
 
     # Trigger manual event to force recording
     event_id = await trigger_manual_event(http_client, camera_name, label="telegram_request", duration=duration)
     
     if not event_id:
-        await update.message.reply_text(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     # Wait for recording to complete + buffer
@@ -885,23 +885,36 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Retry loop for fetching the clip (Frigate needs time to finalize file)
     video_data = None
-    for i in range(3):
+    # Retry up to 10 times (20 seconds) because Frigate export can be slow
+    for i in range(10):
         video_data = await fetch_event_media(http_client, event_id, "clip")
         if video_data:
              break
         await asyncio.sleep(2)
     
     if not video_data:
-        # Fallback: try time-based fetch if event clip fails (unlikely but safe)
-        now = int(time.time())
-        video_data = await fetch_recording_clip(http_client, camera_name, now - (duration + 5), now - 5)
+        # Fallback: try time-based fetch using precise event times
+        logger.warning("Event clip fetch failed for %s, trying fallback with recording segments.", event_id)
+        event_details = await fetch_event_details(http_client, event_id)
+        
+        if event_details:
+             start_ts = event_details.get("start_time")
+             end_ts = event_details.get("end_time")
+             if start_ts and end_ts:
+                 # Add small buffer to ensure we cover the full duration if slightly misaligned
+                 video_data = await fetch_recording_clip(http_client, camera_name, start_ts, end_ts)
+        
+        # If still no data, try the rough estimate
+        if not video_data:
+             now = int(time.time())
+             video_data = await fetch_recording_clip(http_client, camera_name, now - (duration + 5), now - 5)
 
     if not video_data:
-        await update.message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
-    await update.message.reply_video(
+    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
+    await update.effective_message.reply_video(
         video=video_data,
         caption=f"🎬 Clip: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
@@ -918,15 +931,10 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     http_client = context.bot_data["http_client"]
     cameras = await fetch_camera_list(http_client)
     if not cameras:
-        await update.message.reply_text("Could not retrieve camera list from Frigate.")
+        await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
-    # Use a past window (duration: 30s)
-    now = int(time.time())
-    start_ts = now - 45
-    end_ts = now - 15
-
-    await update.message.reply_text(f"🎬 Fetching 30s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(f"🎬 Fetching 30s clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
 
     # Fetch and send video clips
     async def fetch_and_send(camera):
@@ -934,19 +942,36 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Trigger manual event
         event_id = await trigger_manual_event(http_client, camera, label="telegram_request", duration=duration)
         if not event_id:
-            await update.message.reply_text(f"❌ Failed to start recording for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(f"❌ Failed to start recording for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
             return
 
         # Wait handled outside loop to be concurrent
-        # But we need to fetch after waiting. 
-        # To keep it simple in parallel: wait inside here? No, better to wait once globally if possible.
-        # Actually, asyncio.gather runs all these in parallel. So if we sleep inside, they all sleep comfortably together.
         await asyncio.sleep(duration + 5)
 
-        data = await fetch_event_media(http_client, event_id, "clip")
+        # Retry loop for event clip
+        data = None
+        for _ in range(10):
+            data = await fetch_event_media(http_client, event_id, "clip")
+            if data:
+                break
+            await asyncio.sleep(2)
+
+        # Fallback to precise recording clip
+        if not data:
+             event_details = await fetch_event_details(http_client, event_id)
+             if event_details:
+                 s = event_details.get("start_time")
+                 e = event_details.get("end_time")
+                 if s and e:
+                     data = await fetch_recording_clip(http_client, camera, s, e)
         
+        # Final fallback
+        if not data:
+             now = int(time.time())
+             data = await fetch_recording_clip(http_client, camera, now - (duration + 5), now - 5)
+
         if data:
-            await update.message.reply_video(
+            await update.effective_message.reply_video(
                 video=data,
                 caption=f"🎬 Clip: {html.escape(camera)}",
                 parse_mode=ParseMode.HTML,
@@ -957,7 +982,7 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.message.reply_text(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
+            await update.effective_message.reply_text(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
 
     # Note: This will take (duration + 5) seconds total as all tasks sleep in parallel
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
@@ -970,30 +995,30 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not context.args:
         menu = await get_camera_selection_menu(http_client, "video_last")
         if menu:
-            await update.message.reply_text("⏮️ Select a camera for last event:", reply_markup=menu)
+            await update.effective_message.reply_text("⏮️ Select a camera for last event:", reply_markup=menu)
         else:
-            await update.message.reply_text("Could not retrieve camera list from Frigate.")
+            await update.effective_message.reply_text("Could not retrieve camera list from Frigate.")
         return
 
     camera_name = " ".join(context.args)
 
-    await update.message.reply_text(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
-    await update.message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
+    await update.effective_message.reply_text(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_chat_action(ChatAction.UPLOAD_VIDEO)
 
     event = await fetch_latest_event(http_client, camera_name)
     if not event:
-        await update.message.reply_text(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
     event_id = event.get("id")
     video_data = await fetch_event_media(http_client, event_id, "clip")
 
     if not video_data:
-        await update.message.reply_text(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
         return
 
     caption = format_caption(event)
-    await update.message.reply_video(
+    await update.effective_message.reply_video(
         video=video_data,
         caption=caption,
         parse_mode=ParseMode.HTML,
