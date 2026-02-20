@@ -67,29 +67,29 @@ if not DEBUG:
 # ─────────────────────── Monitor Config Parser ───────────────────────
 
 
-def parse_monitor_config(raw: str) -> dict[str, list[str]]:
+def parse_monitor_config(raw: str) -> dict[str, set[str]]:
     """Parse MONITOR_CONFIG env var into a camera→zones mapping.
 
     Format:  camera1:zone_a,zone_b;camera2:all
-    Returns: {"camera1": ["zone_a", "zone_b"], "camera2": ["all"]}
+    Returns: {"camera1": {"zone_a", "zone_b"}, "camera2": {"all"}}
 
     If the string is empty, returns an empty dict (= monitor everything).
     """
     if not raw.strip():
         return {}
 
-    config: dict[str, list[str]] = {}
+    config: dict[str, set[str]] = {}
     for entry in raw.split(";"):
         entry = entry.strip()
         if not entry:
             continue
         if ":" in entry:
             camera, zones_str = entry.split(":", 1)
-            zones = [z.strip() for z in zones_str.split(",") if z.strip()]
-            config[camera.strip()] = zones if zones else ["all"]
+            zones = {z.strip() for z in zones_str.split(",") if z.strip()}
+            config[camera.strip()] = zones if zones else {"all"}
         else:
             # Camera name without zones → monitor all zones
-            config[entry.strip()] = ["all"]
+            config[entry.strip()] = {"all"}
     return config
 
 
@@ -304,7 +304,7 @@ def event_matches_config(event: dict) -> bool:
 
     event_zones = event.get("zones", [])
     # Match if any event zone is in the allowed list
-    return bool(set(event_zones) & set(allowed_zones))
+    return not allowed_zones.isdisjoint(event_zones)
 
 
 # ─────────────────────── Caption Formatting ──────────────────────────
