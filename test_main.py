@@ -294,8 +294,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         """Test cmd_video_last with successful fetch."""
         # Setup context
         update = MagicMock()
-        update.message.reply_text = AsyncMock()
-        update.message.reply_video = AsyncMock()
+        update.effective_message.reply_text = AsyncMock()
+        update.effective_message.reply_video = AsyncMock()
         
         context = MagicMock()
         context.args = ["garage"]
@@ -319,8 +319,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         # Verify
         mock_fetch_events.assert_called_with(context.bot_data["http_client"], "garage", limit=5)
-        update.message.reply_text.assert_called()
-        update.message.reply_video.assert_called_once()
+        update.effective_message.reply_text.assert_called()
+        update.effective_message.reply_video.assert_called_once()
     
 if __name__ == "__main__":
     unittest.main()
