@@ -423,6 +423,27 @@ async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | N
         return None
 
 
+async def trigger_manual_event(
+    client: httpx.AsyncClient, camera: str, label: str = "manual", duration: int = 30
+) -> str | None:
+    """Trigger a manual event in Frigate to force a recording."""
+    try:
+        # POST /api/events/<camera>/<label>/create
+        url = f"{FRIGATE_URL}/api/events/{urllib.parse.quote(camera)}/{urllib.parse.quote(label)}/create"
+        params = {"include_recording": "1", "duration": str(duration)}
+        
+        if DEBUG:
+            logger.debug("Triggering manual event: %s params=%s", url, params)
+
+        resp = await client.post(url, params=params, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("event_id")
+    except Exception as exc:
+        logger.error("Error triggering manual event for %s: %s", camera, exc)
+        return None
+
+
 # ─────────────────────── Event Filtering ─────────────────────────────
 
 
@@ -807,23 +828,36 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     camera_name = " ".join(context.args)
     http_client = context.bot_data["http_client"]
 
-    # Use a window that is in the past to ensure Frigate has saved the segments.
-    now = int(time.time())
-    start_ts = now - 45  # Start from 45s ago
-    end_ts = now - 15    # Ends at 15s ago (30s duration)
-    
-    await update.message.reply_text(f"🎬 Fetching 30s clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    duration = 30
+    await update.message.reply_text(f"🎬 Starting {duration}s manual recording for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
 
-    video_data = await fetch_recording_clip(http_client, camera_name, start_ts, end_ts)
+    # Trigger manual event to force recording
+    event_id = await trigger_manual_event(http_client, camera_name, label="telegram_request", duration=duration)
+    
+    if not event_id:
+        await update.message.reply_text(f"❌ Failed to start recording for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        return
+
+    # Wait for recording to complete + buffer
+    await asyncio.sleep(duration + 5)
+
+    # Fetch the specific event clip
+    video_data = await fetch_event_media(http_client, event_id, "clip")
+    
     if not video_data:
-        await update.message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
+        # Fallback: try time-based fetch if event clip fails (unlikely but safe)
+        now = int(time.time())
+        video_data = await fetch_recording_clip(http_client, camera_name, now - (duration + 5), now - 5)
+
+    if not video_data:
+        await update.message.reply_text(f"❌ Could not fetch video clip for {html.escape(camera_name)} (Event {event_id})", parse_mode=ParseMode.HTML)
         return
 
     await update.message.reply_video(
         video=video_data,
         caption=f"🎬 Clip: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
-        filename=f"{camera_name}.mp4",
+        filename=f"{camera_name}_{event_id}.mp4",
         supports_streaming=True,
         read_timeout=UPLOAD_TIMEOUT,
         write_timeout=UPLOAD_TIMEOUT,
@@ -848,21 +882,36 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Fetch and send video clips
     async def fetch_and_send(camera):
-        data = await fetch_recording_clip(http_client, camera, start_ts, end_ts)
+        duration = 30
+        # Trigger manual event
+        event_id = await trigger_manual_event(http_client, camera, label="telegram_request", duration=duration)
+        if not event_id:
+            await update.message.reply_text(f"❌ Failed to start recording for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
+            return
+
+        # Wait handled outside loop to be concurrent
+        # But we need to fetch after waiting. 
+        # To keep it simple in parallel: wait inside here? No, better to wait once globally if possible.
+        # Actually, asyncio.gather runs all these in parallel. So if we sleep inside, they all sleep comfortably together.
+        await asyncio.sleep(duration + 5)
+
+        data = await fetch_event_media(http_client, event_id, "clip")
+        
         if data:
             await update.message.reply_video(
                 video=data,
                 caption=f"🎬 Clip: {html.escape(camera)}",
                 parse_mode=ParseMode.HTML,
-                filename=f"{camera}.mp4",
+                filename=f"{camera}_{event_id}.mp4",
                 supports_streaming=True,
                 read_timeout=UPLOAD_TIMEOUT,
                 write_timeout=UPLOAD_TIMEOUT,
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.message.reply_text(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
 
+    # Note: This will take (duration + 5) seconds total as all tasks sleep in parallel
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
 

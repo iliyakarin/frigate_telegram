@@ -146,5 +146,29 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["params"]["limit"], 1)
         self.assertEqual(kwargs["params"]["has_clip"], 1)
 
+    @patch("main.trigger_manual_event")
+    @patch("main.fetch_event_media")
+    @patch("asyncio.sleep")  # skip waiting
+    async def test_cmd_video_manual_trigger(self, mock_sleep, mock_media, mock_trigger):
+        # Setup context
+        update = AsyncMock()
+        update.effective_chat.id = "fake"
+        context = MagicMock()
+        context.args = ["garage"]
+        context.bot_data = {"http_client": MagicMock()}
+
+        # Mocks
+        mock_trigger.return_value = "evt_123"
+        mock_media.return_value = b"video_bytes"
+
+        # Execute
+        await main.cmd_video(update, context)
+
+        # Verify
+        mock_trigger.assert_called_once()
+        mock_media.assert_called_once_with(context.bot_data["http_client"], "evt_123", "clip")
+        # Ensure we sent a video
+        update.message.reply_video.assert_called_once()
+        
 if __name__ == "__main__":
     unittest.main()
