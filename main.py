@@ -13,6 +13,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -561,18 +562,35 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 # ─────────────────── Telegram Command Handlers ───────────────────────
 
 
+def authorized_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_chat or str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID):
+            logger.warning(
+                "Unauthorized command attempt from chat_id=%s",
+                update.effective_chat.id if update.effective_chat else "unknown",
+            )
+            return
+        return await func(update, context)
+
+    return wrapper
+
+
+@authorized_only
 async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await state.enable()
     await update.message.reply_text("✅ Notifications enabled.")
     logger.info("Notifications enabled via Telegram command.")
 
 
+@authorized_only
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await state.disable()
     await update.message.reply_text("🔕 Notifications disabled.")
     logger.info("Notifications disabled via Telegram command.")
 
 
+@authorized_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_emoji = "✅" if state.enabled else "🔕"
     cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "all"
