@@ -223,37 +223,41 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["reply_markup"], mock_menu)
         self.assertIn("Select a camera", args[0])
 
-    @patch("main.trigger_manual_event")
-    @patch("main.fetch_event_media")
-    @patch("asyncio.sleep")
-    async def test_cmd_video_callback(self, mock_sleep, mock_media, mock_trigger):
-        """Test cmd_video when triggered by a callback (update.message is None)."""
-        # Setup context
+    @patch("main.cmd_photo_all")
+    @patch("main.cmd_photo")
+    @patch("main.get_main_menu")
+    @patch("main.get_camera_selection_menu")
+    async def test_button_handler_logic(self, mock_cam_menu, mock_main_menu, mock_cmd_photo, mock_cmd_photo_all):
+        """Test the new button_handler navigation and command logic."""
         update = MagicMock()
-        update.message = None # Simulating callback
-        
-        # effective_chat is used
-        update.effective_chat.send_video = AsyncMock()
-        update.effective_chat.send_action = AsyncMock()
-        update.effective_chat.send_message = AsyncMock()
-        
+        update.callback_query = AsyncMock()
         context = MagicMock()
-        context.args = ["garage"] # Button handler sets this
         context.bot_data = {"http_client": MagicMock()}
 
-        # Mocks
-        mock_trigger.return_value = "evt_callback"
-        mock_media.return_value = b"video_bytes"
+        # 1. Test Navigation to Snapshot Menu
+        update.callback_query.data = "nav:snapshot"
+        mock_cam_menu.return_value = MagicMock()
+        await main.button_handler(update, context)
+        update.callback_query.edit_message_text.assert_called()
+        self.assertIn("Snapshots", update.callback_query.edit_message_text.call_args.args[0])
 
-        with patch("main.TELEGRAM_CHAT_ID", 12345):
-             update.effective_chat.id = 12345
-             await main.cmd_video(update, context)
+        # 2. Test Notification Toggle
+        update.callback_query.data = "toggle:notifications"
+        initial_state = main.state.enabled
+        await main.button_handler(update, context)
+        self.assertNotEqual(main.state.enabled, initial_state)
+        update.callback_query.edit_message_reply_markup.assert_called()
 
-        # Verify
-        mock_trigger.assert_called_once()
-        update.effective_chat.send_action.assert_any_call(main.ChatAction.RECORD_VIDEO)
-        update.effective_chat.send_action.assert_any_call(main.ChatAction.UPLOAD_VIDEO)
-        update.effective_chat.send_video.assert_called_once()
+        # 3. Test "All" Command Trigger
+        update.callback_query.data = "all:photo_all"
+        await main.button_handler(update, context)
+        mock_cmd_photo_all.assert_called_with(update, context)
+
+        # 4. Test Single Camera Command Trigger
+        update.callback_query.data = "cmd:photo:garage"
+        await main.button_handler(update, context)
+        mock_cmd_photo.assert_called_with(update, context)
+        self.assertEqual(context.args, ["garage"])
         
     @patch("main.fetch_event_media")
     @patch("main.fetch_event_details")

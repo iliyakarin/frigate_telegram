@@ -773,9 +773,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome = (
         "👋 <b>Welcome to Frigate-Telegram!</b>\n\n"
         "I'll send you rich notifications for Frigate detection events.\n\n"
-        "Use /help to see available commands."
+        "Use the menu below or /help to see available commands."
     )
-    await update.message.reply_text(welcome, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(welcome, reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
+
+
+@authorized_only
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the main interaction menu."""
+    await update.message.reply_text("📱 <b>Main Menu</b>", reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
 
 @authorized_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -814,7 +820,30 @@ async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 
-async def get_camera_selection_menu(http_client: httpx.AsyncClient, command: str) -> InlineKeyboardMarkup | None:
+async def get_main_menu() -> InlineKeyboardMarkup:
+    """Create the top-level main menu."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📸 Snapshots", callback_data="nav:snapshot"),
+            InlineKeyboardButton("🎬 Clips", callback_data="nav:video"),
+        ],
+        [
+            InlineKeyboardButton("⏮️ Recent", callback_data="nav:video_last"),
+            InlineKeyboardButton("📊 Status", callback_data="cmd:status:none"),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔔 Notifications: ON" if state.enabled else "🔕 Notifications: OFF",
+                callback_data="toggle:notifications"
+            )
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def get_camera_selection_menu(
+    http_client: httpx.AsyncClient, command: str, include_all: bool = False
+) -> InlineKeyboardMarkup | None:
     """Create an inline keyboard with buttons for each camera."""
     cameras = await fetch_camera_list(http_client)
     if not cameras:
@@ -831,6 +860,11 @@ async def get_camera_selection_menu(http_client: httpx.AsyncClient, command: str
             row.append(InlineKeyboardButton(cam2, callback_data=f"cmd:{command}:{cam2}"))
         keyboard.append(row)
     
+    if include_all:
+        all_cmd = f"photo_all" if command == "photo" else f"video_all" if command == "video" else "video_all_last"
+        keyboard.append([InlineKeyboardButton("✨ All Cameras", callback_data=f"all:{all_cmd}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="nav:main")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1082,33 +1116,78 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle callback queries from inline keyboards."""
     query = update.callback_query
+    if not query:
+        return
+
     await query.answer()
-
-    # Data format: cmd:<command>:<camera_name>
     data = query.data
-    if not data.startswith("cmd:"):
+    if not data:
         return
 
-    try:
-        _, command, camera_name = data.split(":", 2)
-    except ValueError:
-        logger.warning("Invalid callback data: %s", data)
+    http_client = context.bot_data["http_client"]
+
+    # 1. Navigation handling
+    if data.startswith("nav:"):
+        _, target = data.split(":", 1)
+        if target == "main":
+            await query.edit_message_text("📱 <b>Main Menu</b>", reply_markup=await get_main_menu(), parse_mode=ParseMode.HTML)
+        elif target == "snapshot":
+            menu = await get_camera_selection_menu(http_client, "photo", include_all=True)
+            await query.edit_message_text("📸 <b>Snapshots</b>\nSelect a camera or view all:", reply_markup=menu, parse_mode=ParseMode.HTML)
+        elif target == "video":
+            menu = await get_camera_selection_menu(http_client, "video", include_all=True)
+            await query.edit_message_text("🎬 <b>Manual Recordings</b>\nSelect a camera to start 30s recording:", reply_markup=menu, parse_mode=ParseMode.HTML)
+        elif target == "video_last":
+            menu = await get_camera_selection_menu(http_client, "video_last", include_all=True)
+            await query.edit_message_text("⏮️ <b>Latest Activity</b>\nSelect a camera to see the last recorded event:", reply_markup=menu, parse_mode=ParseMode.HTML)
         return
 
-    # Delete the menu message
-    await query.delete_message()
+    # 2. Toggle handling
+    if data == "toggle:notifications":
+        if state.enabled:
+            await state.disable()
+        else:
+            await state.enable()
+        # Refresh the menu
+        await query.edit_message_reply_markup(reply_markup=await get_main_menu())
+        return
 
-    # Reuse existing command logic by faking args
-    context.args = [camera_name]
-    
-    if command == "photo":
-        await cmd_photo(update, context)
-    elif command == "video":
-        await cmd_video(update, context)
-    elif command == "video_last":
-        await cmd_video_last(update, context)
-    else:
-        logger.warning("Unknown command in callback: %s", command)
+    # 3. "All" command handling
+    if data.startswith("all:"):
+        _, cmd = data.split(":", 1)
+        await query.delete_message()
+        if cmd == "photo_all":
+            await cmd_photo_all(update, context)
+        elif cmd == "video_all":
+            await cmd_video_all(update, context)
+        elif cmd == "video_all_last":
+            await cmd_video_all_last(update, context)
+        return
+
+    # 4. Single command handling
+    if data.startswith("cmd:"):
+        try:
+            _, command, camera_name = data.split(":", 2)
+        except ValueError:
+            logger.warning("Invalid callback data: %s", data)
+            return
+
+        # Delete the menu message
+        await query.delete_message()
+
+        # Reuse existing command logic by faking args
+        context.args = [] if camera_name == "none" else [camera_name]
+        
+        if command == "photo":
+            await cmd_photo(update, context)
+        elif command == "video":
+            await cmd_video(update, context)
+        elif command == "video_last":
+            await cmd_video_last(update, context)
+        elif command == "status":
+            await cmd_status(update, context)
+        else:
+            logger.warning("Unknown command in callback: %s", command)
 
 
 # ─────────────────────── Main Polling Loop ───────────────────────────
@@ -1215,6 +1294,7 @@ async def main() -> None:
     app.add_handler(CommandHandler(["disable_notifications", "disable"], cmd_disable))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cameras", cmd_cameras))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("photo_all", cmd_photo_all))
     app.add_handler(CommandHandler("video", cmd_video))
