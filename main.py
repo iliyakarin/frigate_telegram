@@ -407,12 +407,12 @@ async def fetch_recording_clip(
     )
 
 
-async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | None:
-    """Fetch the latest event for a specific camera that has a clip."""
+async def fetch_recent_events(client: httpx.AsyncClient, camera: str, limit: int = 5) -> list[dict]:
+    """Fetch the most recent events for a specific camera that have clips."""
     try:
         params = {
             "camera": camera,
-            "limit": 1,
+            "limit": limit,
             "has_clip": 1,
         }
         resp = await client.get(
@@ -424,11 +424,11 @@ async def fetch_latest_event(client: httpx.AsyncClient, camera: str) -> dict | N
         resp.raise_for_status()
         events = resp.json()
         if events and isinstance(events, list):
-            return events[0]
-        return None
+            return events
+        return []
     except Exception as exc:
-        logger.error("Error fetching latest event for %s: %s", camera, exc)
-        return None
+        logger.error("Error fetching recent events for %s: %s", camera, exc)
+        return []
 
 
 async def fetch_video_data_robust(
@@ -999,22 +999,30 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     camera_name = " ".join(context.args)
     http_client = context.bot_data["http_client"]
 
-    await update.message.reply_text(f"🎬 Fetching last event clip for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"🎬 Fetching recent event for <code>{html.escape(camera_name)}</code>...", parse_mode=ParseMode.HTML)
 
-    event = await fetch_latest_event(http_client, camera_name)
-    if not event:
+    events = await fetch_recent_events(http_client, camera_name, limit=5)
+    if not events:
         await update.message.reply_text(f"❌ No recent events with clips found for {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
-    event_id = event.get("id")
-    # Robust fetch with no wait (event is old) but with recording fallback
-    video_data = await fetch_video_data_robust(http_client, camera_name, event_id)
+    video_data = None
+    successful_event = None
 
-    if not video_data:
-        await update.message.reply_text(f"❌ Could not fetch video clip for event {event_id}", parse_mode=ParseMode.HTML)
+    for event in events:
+        event_id = event.get("id")
+        logger.info("Trying to fetch video for event %s (camera: %s)", event_id, camera_name)
+        video_data = await fetch_video_data_robust(http_client, camera_name, event_id)
+        if video_data:
+            successful_event = event
+            break
+        logger.warning("Could not fetch video for event %s, trying next...", event_id)
+
+    if not video_data or not successful_event:
+        await update.message.reply_text(f"❌ Could not fetch video for any of the last {len(events)} events on {html.escape(camera_name)}", parse_mode=ParseMode.HTML)
         return
 
-    caption = format_caption(event)
+    caption = format_caption(successful_event)
     await update.message.reply_video(
         video=video_data,
         caption=caption,
@@ -1038,19 +1046,25 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"🎬 Fetching last event clips for {len(cameras)} cameras...", parse_mode=ParseMode.HTML)
 
     async def fetch_and_send(camera):
-        event = await fetch_latest_event(http_client, camera)
-        if not event:
+        events = await fetch_recent_events(http_client, camera, limit=5)
+        if not events:
             await update.message.reply_text(f"❌ No recent events with clips for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
             return
 
-        event_id = event.get("id")
-        # Robust fetch
-        data = await fetch_video_data_robust(http_client, camera, event_id)
-        
-        if data:
-            caption = format_caption(event)
+        video_data = None
+        successful_event = None
+
+        for event in events:
+            event_id = event.get("id")
+            video_data = await fetch_video_data_robust(http_client, camera, event_id)
+            if video_data:
+                successful_event = event
+                break
+
+        if video_data and successful_event:
+            caption = format_caption(successful_event)
             await update.message.reply_video(
-                video=data,
+                video=video_data,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename=f"{camera}_last.mp4",
@@ -1060,7 +1074,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             )
         else:
-            await update.message.reply_text(f"❌ Failed to fetch last clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"❌ Failed to fetch video for any of the last {len(events)} events on <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
 
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 

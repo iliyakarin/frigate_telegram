@@ -130,7 +130,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Found", call_args.kwargs["caption"])
 
     @patch("main._http_auth")
-    async def test_fetch_latest_event(self, mock_auth):
+    async def test_fetch_recent_events(self, mock_auth):
         mock_client = AsyncMock()
         mock_resp = MagicMock()
         # Mock returns a list of events
@@ -138,13 +138,14 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_resp.raise_for_status = MagicMock()
         mock_client.get.return_value = mock_resp
 
-        event = await main.fetch_latest_event(mock_client, "cam1")
-        self.assertEqual(event["id"], "event_123")
+        events = await main.fetch_recent_events(mock_client, "cam1")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["id"], "event_123")
 
         # Verify params
         args, kwargs = mock_client.get.call_args
         self.assertEqual(kwargs["params"]["camera"], "cam1")
-        self.assertEqual(kwargs["params"]["limit"], 1)
+        self.assertEqual(kwargs["params"]["limit"], 5)
         self.assertEqual(kwargs["params"]["has_clip"], 1)
 
     async def test_fetch_recording_clip_url(self):
@@ -283,9 +284,9 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         data = await main.fetch_video_data_robust(client, "cam1", "evt1")
         self.assertEqual(data, b"rough_clip")
 
-    @patch("main.fetch_latest_event")
+    @patch("main.fetch_recent_events")
     @patch("main.fetch_video_data_robust")
-    async def test_cmd_video_last_success(self, mock_robust, mock_fetch_event):
+    async def test_cmd_video_last_success(self, mock_robust, mock_fetch_events):
         """Test cmd_video_last with successful fetch."""
         # Setup context
         update = MagicMock()
@@ -297,7 +298,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         context.bot_data = {"http_client": MagicMock()}
 
         # Mocks
-        mock_fetch_event.return_value = {
+        mock_fetch_events.return_value = [{
             "id": "evt_last",
             "camera": "garage",
             "label": "person",
@@ -305,7 +306,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
             "end_time": 1030,
             "zones": [],
             "thumbnail": "thumb"
-        }
+        }]
         mock_robust.return_value = b"video_bytes"
 
         with patch("main.TELEGRAM_CHAT_ID", 12345):
@@ -313,7 +314,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
              await main.cmd_video_last(update, context)
 
         # Verify
-        mock_fetch_event.assert_called_with(context.bot_data["http_client"], "garage")
+        mock_fetch_events.assert_called_with(context.bot_data["http_client"], "garage", limit=5)
         update.message.reply_text.assert_called()
         update.message.reply_video.assert_called_once()
     
