@@ -189,7 +189,7 @@ volumes:
 # Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables (or create a .env file)
+# Set environment variables
 export FRIGATE_URL=http://localhost:5000
 export TELEGRAM_BOT_TOKEN=your-token
 export TELEGRAM_CHAT_ID=your-chat-id
