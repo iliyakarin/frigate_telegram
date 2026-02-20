@@ -5,6 +5,7 @@ to Telegram as a single animated GIF message with event details in the caption.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -354,17 +355,17 @@ def format_caption(event: dict) -> str:
     lines = [
         f"🚨 <b>Detection Alert</b>",
         f"",
-        f"📷 <b>Camera:</b> {camera}",
-        f"🏷️ <b>Label:</b> {label} ({score_str})",
-        f"📍 <b>Zone(s):</b> {zones}",
+        f"📷 <b>Camera:</b> {html.escape(camera)}",
+        f"🏷️ <b>Label:</b> {html.escape(label)} ({score_str})",
+        f"📍 <b>Zone(s):</b> {html.escape(zones)}",
     ]
 
     # Face recognition: show recognized name when sub_label is present
     if sub_label_name:
         if sub_label_score is not None:
-            lines.append(f"👤 <b>Recognized:</b> {sub_label_name} ({sub_label_score:.0%})")
+            lines.append(f"👤 <b>Recognized:</b> {html.escape(sub_label_name)} ({sub_label_score:.0%})")
         else:
-            lines.append(f"👤 <b>Recognized:</b> {sub_label_name}")
+            lines.append(f"👤 <b>Recognized:</b> {html.escape(sub_label_name)}")
 
     lines.append(f"📅 <b>Time:</b> {start_time}")
 
@@ -377,7 +378,7 @@ def format_caption(event: dict) -> str:
     # External event link (Cloudflare Tunnel URL)
     if EXTERNAL_URL:
         event_url = f"{EXTERNAL_URL}/events/{event_id}"
-        lines.append(f'🔗 <a href="{event_url}">View Event in Frigate</a>')
+        lines.append(f'🔗 <a href="{html.escape(event_url, quote=True)}">View Event in Frigate</a>')
 
     return "\n".join(lines)
 
@@ -510,9 +511,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Notifications: {status_emoji} {'enabled' if state.enabled else 'disabled'}",
         f"Polling interval: {POLLING_INTERVAL}s",
         f"Upload timeout: {UPLOAD_TIMEOUT}s",
-        f"Monitored cameras: {cameras}",
-        f"Frigate URL: {FRIGATE_URL}",
-        f"External URL: {EXTERNAL_URL or 'not configured'}",
+        f"Monitored cameras: {html.escape(cameras)}",
+        f"Frigate URL: {html.escape(FRIGATE_URL)}",
+        f"External URL: {html.escape(EXTERNAL_URL) if EXTERNAL_URL else 'not configured'}",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
