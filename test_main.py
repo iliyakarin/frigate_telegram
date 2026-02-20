@@ -11,6 +11,7 @@ import unittest
 import html
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 # Set environment variables for main.py import
 os.environ["FRIGATE_URL"] = "http://localhost:5000"
@@ -75,6 +76,58 @@ class TestMainLogic(unittest.TestCase):
         ]
         for raw, expected in cases:
             self.assertEqual(main.parse_monitor_config(raw), expected)
+
+    def test_format_caption_sub_label_dict(self):
+        event = {
+            "id": "123",
+            "camera": "cam",
+            "label": "person",
+            "sub_label": {"label": "John", "score": 0.95},
+            "top_score": 0.9,
+            "start_time": 1672531200,
+        }
+        caption = main.format_caption(event)
+        self.assertIn("John", caption)
+        self.assertIn("95%", caption)
+
+    def test_format_caption_sub_label_in_data(self):
+        event = {
+            "id": "123",
+            "camera": "cam",
+            "label": "person",
+            "data": {"sub_label": "Jane"},
+            "top_score": 0.9,
+            "start_time": 1672531200,
+        }
+        caption = main.format_caption(event)
+        self.assertIn("Jane", caption)
+
+class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
+    @patch("main.fetch_event_details")
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot")
+    async def test_send_event_notification_refetches(self, mock_snap, mock_media, mock_fetch_details):
+        bot = MagicMock()
+        bot.send_animation = AsyncMock()
+        http_client = MagicMock()
+        event = {"id": "123", "camera": "cam"}
+
+        mock_fetch_details.return_value = {"id": "123", "camera": "cam", "sub_label": "Found", "start_time": 1672531200}
+        mock_media.return_value = b"gif_data"
+        mock_snap.return_value = b"snap_data"
+
+        # Set MEDIA_WAIT_TIMEOUT to 0 for faster test
+        original_timeout = main.MEDIA_WAIT_TIMEOUT
+        main.MEDIA_WAIT_TIMEOUT = 0
+        try:
+            await main.send_event_notification(bot, event, http_client)
+        finally:
+            main.MEDIA_WAIT_TIMEOUT = original_timeout
+
+        mock_fetch_details.assert_called_once_with(http_client, "123")
+        # Verify that Found is in the caption sent to telegram
+        call_args = bot.send_animation.call_args
+        self.assertIn("Found", call_args.kwargs["caption"])
 
 if __name__ == "__main__":
     unittest.main()

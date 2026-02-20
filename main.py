@@ -325,6 +325,21 @@ async def _fetch_frigate_api(
     return await fetch_media_with_retry(client, url, label, expected_content_type)
 
 
+async def fetch_event_details(client: httpx.AsyncClient, event_id: str) -> dict | None:
+    """Fetch full event details from Frigate API."""
+    try:
+        resp = await client.get(
+            f"{FRIGATE_URL}/api/events/{event_id}",
+            auth=_http_auth(),
+            timeout=FRIGATE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.warning("Error fetching event details for %s: %s", event_id, exc)
+        return None
+
+
 async def fetch_event_media(
     client: httpx.AsyncClient,
     event_id: str,
@@ -422,19 +437,23 @@ def format_caption(event: dict) -> str:
     """Build an HTML caption for the Telegram animation message.
 
     Includes face recognition sub_label when available from Frigate.
-    Handles sub_label as both [name, score] array and plain string.
+    Handles sub_label as [name, score] array, plain string, or dictionary.
     """
     event_id = event.get("id", "unknown")
     camera = event.get("camera", "unknown")
     label = event.get("label", "object")
     raw_sub_label = event.get("sub_label")
+    # Fallback to data field if top-level sub_label is missing
+    if not raw_sub_label and "data" in event:
+        raw_sub_label = event.get("data", {}).get("sub_label")
+
     zones = ", ".join(event.get("zones", [])) or "N/A"
     score = event.get("top_score")
     score_str = f"{score:.0%}" if score else "N/A"
     start_time = _epoch_to_datetime(event.get("start_time"))
     end_time = _epoch_to_datetime(event.get("end_time"))
 
-    # Parse sub_label — Frigate returns either ["name", score] or a plain string
+    # Parse sub_label — Frigate returns either ["name", score], plain string, or dictionary
     sub_label_name = None
     sub_label_score = None
     if isinstance(raw_sub_label, list) and len(raw_sub_label) >= 1:
@@ -444,8 +463,14 @@ def format_caption(event: dict) -> str:
                 sub_label_score = float(raw_sub_label[1])
             except (ValueError, TypeError):
                 pass
+    elif isinstance(raw_sub_label, dict):
+        sub_label_name = raw_sub_label.get("label") or raw_sub_label.get("name")
+        sub_label_score = raw_sub_label.get("score")
     elif isinstance(raw_sub_label, str) and raw_sub_label:
         sub_label_name = raw_sub_label
+
+    if DEBUG and raw_sub_label:
+        logger.debug("Event %s raw sub_label: %s", event_id, raw_sub_label)
 
     lines = [
         f"🚨 <b>Detection Alert</b>",
@@ -487,8 +512,9 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 
     Flow:
     1. Wait MEDIA_WAIT_TIMEOUT seconds so Frigate can generate the preview.
-    2. Fetch clip/GIF, thumbnail, and camera snapshot in parallel.
-    3. Send ONE message:
+    2. Refetch event details to get the latest metadata (like sub_label).
+    3. Fetch clip/GIF, thumbnail, and camera snapshot in parallel.
+    4. Send ONE message:
        - SEND_CLIP + clip → send_video (HD clip.mp4)
        - GIF available    → send_animation (preview.gif)
        - No GIF, photo    → send_photo (snapshot/thumbnail)
@@ -499,7 +525,6 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
     """
     event_id = event.get("id", "unknown")
     camera = event.get("camera", "unknown")
-    caption = format_caption(event)
 
     # ── Wait for Frigate to generate previews ────────────────────────
     if MEDIA_WAIT_TIMEOUT > 0:
@@ -508,6 +533,13 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
             event_id, MEDIA_WAIT_TIMEOUT,
         )
         await asyncio.sleep(MEDIA_WAIT_TIMEOUT)
+
+    # ── Refetch event details to get updated sub_label ────────────────
+    updated_event = await fetch_event_details(http_client, event_id)
+    if updated_event:
+        event = updated_event
+
+    caption = format_caption(event)
 
     # ── Fetch all media in parallel ──────────────────────────────────
     gif_task = asyncio.create_task(fetch_event_media(http_client, event_id, "gif"))
