@@ -321,6 +321,67 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_fetch_events.assert_called_with(context.bot_data["http_client"], "garage", limit=5)
         update.effective_chat.send_message.assert_called()
         update.effective_chat.send_video.assert_called_once()
+
+    async def test_fetch_events_deduplication(self):
+        """Test that fetch_events deduplicates events by ID across cameras."""
+        client = MagicMock()
+        client.get = AsyncMock()
+
+        # Mock MONITOR_CONFIG to have two cameras
+        with patch.dict(main.MONITOR_CONFIG, {"cam1": {"all"}, "cam2": {"all"}}, clear=True):
+            event_a = {"id": "A", "camera": "cam1", "start_time": 100}
+            event_b = {"id": "B", "camera": "cam1", "start_time": 101} # duplicate ID
+            event_b_copy = {"id": "B", "camera": "cam2", "start_time": 101} # duplicate ID
+            event_c = {"id": "C", "camera": "cam2", "start_time": 102}
+
+            async def side_effect(url, params=None, auth=None, timeout=None):
+                if params["camera"] == "cam1":
+                    resp = MagicMock()
+                    resp.raise_for_status = MagicMock()
+                    resp.json.return_value = [event_a, event_b]
+                    return resp
+                elif params["camera"] == "cam2":
+                    resp = MagicMock()
+                    resp.raise_for_status = MagicMock()
+                    resp.json.return_value = [event_b_copy, event_c]
+                    return resp
+                return MagicMock()
+
+            client.get.side_effect = side_effect
+
+            events = await main.fetch_events(client, after_ts=0)
+
+            # Verify we get 3 unique events
+            self.assertEqual(len(events), 3)
+            ids = {e["id"] for e in events}
+            self.assertEqual(ids, {"A", "B", "C"})
+
+    async def test_fetch_events_partial_failure(self):
+        """Test that fetch_events continues if one camera fails."""
+        client = MagicMock()
+        client.get = AsyncMock()
+
+        # Mock MONITOR_CONFIG to have two cameras
+        with patch.dict(main.MONITOR_CONFIG, {"cam1": {"all"}, "cam2": {"all"}}, clear=True):
+            event_a = {"id": "A", "camera": "cam1", "start_time": 100}
+
+            async def side_effect(url, params=None, auth=None, timeout=None):
+                if params["camera"] == "cam1":
+                    resp = MagicMock()
+                    resp.raise_for_status = MagicMock()
+                    resp.json.return_value = [event_a]
+                    return resp
+                elif params["camera"] == "cam2":
+                    raise Exception("Connection failed")
+                return MagicMock()
+
+            client.get.side_effect = side_effect
+
+            events = await main.fetch_events(client, after_ts=0)
+
+            # Should still get events from the working camera
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["id"], "A")
     
 if __name__ == "__main__":
     unittest.main()
