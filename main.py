@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import signal
+from dotenv import load_dotenv
 import sys
 import time
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─────────────────────────── Configuration ───────────────────────────
+
+load_dotenv()
 
 FRIGATE_URL = os.environ.get("FRIGATE_URL", "").rstrip("/")
 FRIGATE_USERNAME = os.environ.get("FRIGATE_USERNAME")
