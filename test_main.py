@@ -6,11 +6,11 @@ sys.modules["httpx"] = MagicMock()
 sys.modules["telegram"] = MagicMock()
 sys.modules["telegram.constants"] = MagicMock()
 sys.modules["telegram.ext"] = MagicMock()
+sys.modules["dotenv"] = MagicMock()
 
 import unittest
 import html
 import os
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 # Set environment variables for main.py import
