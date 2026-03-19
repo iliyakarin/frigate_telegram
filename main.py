@@ -1020,10 +1020,9 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
                 )
             else:
-                await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {html.escape(event_id)})", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Error in fetch_and_send for {camera}: {e}", exc_info=True)
-            await update.effective_chat.send_message(f"⚠️ Error fetching video for {camera}: {str(e)}")
 
     # Note: This will take (duration + 5) seconds total as all tasks sleep in parallel
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
