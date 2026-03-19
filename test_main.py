@@ -9,7 +9,6 @@ sys.modules["telegram.ext"] = MagicMock()
 sys.modules["dotenv"] = MagicMock()
 
 import unittest
-import html
 import os
 from unittest.mock import AsyncMock, patch
 
