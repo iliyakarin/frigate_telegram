@@ -1234,11 +1234,14 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
 
                     if matched:
                         logger.info("Processing %d new event(s)", len(matched))
-                        for event in matched:
+
+                        async def _send_with_error_handling(event):
                             try:
                                 await send_event_notification(bot, event, http_client)
                             except Exception as e:
                                 logger.error("Fatal error processing event notification: %s", e)
+
+                        await asyncio.gather(*[_send_with_error_handling(ev) for ev in matched])
                         logger.info("All events processed.")
                     else:
                         logger.debug("No new matching events.")
