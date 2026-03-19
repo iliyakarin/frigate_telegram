@@ -12,6 +12,13 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+# Mock dependencies that might be missing for standard unit test run
+sys.modules["httpx"] = MagicMock()
+sys.modules["telegram"] = MagicMock()
+sys.modules["telegram.constants"] = MagicMock()
+sys.modules["telegram.ext"] = MagicMock()
+sys.modules["dotenv"] = MagicMock()
+
 # Set required environment variables BEFORE importing main
 os.environ["FRIGATE_URL"] = "http://localhost:5000"
 os.environ["TELEGRAM_BOT_TOKEN"] = "fake_token"
