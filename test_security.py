@@ -1,6 +1,16 @@
+import sys
+from unittest.mock import MagicMock
+
+# Mock third-party dependencies BEFORE importing main
+sys.modules['httpx'] = MagicMock()
+sys.modules['telegram'] = MagicMock()
+sys.modules['telegram.constants'] = MagicMock()
+sys.modules['telegram.ext'] = MagicMock()
+sys.modules['dotenv'] = MagicMock()
+
 import os
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 # Set required environment variables BEFORE importing main
 os.environ["FRIGATE_URL"] = "http://localhost:5000"

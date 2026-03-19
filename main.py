@@ -367,7 +367,7 @@ async def fetch_event_media(
 
 async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes | None:
     """Fetch the latest snapshot JPEG from a camera."""
-    safe_camera = urllib.parse.quote(camera)
+    safe_camera = urllib.parse.quote(camera, safe='')
     return await _fetch_frigate_api(
         client,
         f"{safe_camera}/latest.jpg?bbox=1",
@@ -395,7 +395,7 @@ async def fetch_recording_clip(
 ) -> bytes | None:
     """Fetch a recording clip for a specific time range."""
     # Frigate API: /api/<camera_name>/start/<start_ts>/end/<end_ts>/clip.mp4
-    safe_camera = urllib.parse.quote(camera)
+    safe_camera = urllib.parse.quote(camera, safe='')
     return await _fetch_frigate_api(
         client,
         f"{safe_camera}/start/{start_ts}/end/{end_ts}/clip.mp4",
@@ -475,7 +475,7 @@ async def trigger_manual_event(
     """Trigger a manual event in Frigate to force a recording."""
     try:
         # POST /api/events/<camera>/<label>/create
-        url = f"{FRIGATE_URL}/api/events/{urllib.parse.quote(camera)}/{urllib.parse.quote(label)}/create"
+        url = f"{FRIGATE_URL}/api/events/{urllib.parse.quote(camera, safe='')}/{urllib.parse.quote(label, safe='')}/create"
         params = {"include_recording": "1", "duration": str(duration)}
         
         if DEBUG:
