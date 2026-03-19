@@ -16,12 +16,12 @@ import urllib.parse
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Literal, Callable
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     Application,
