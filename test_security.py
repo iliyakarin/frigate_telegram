@@ -1,7 +1,16 @@
 import sys
+from unittest.mock import MagicMock
+
+# Mock third-party dependencies BEFORE importing main
+sys.modules['httpx'] = MagicMock()
+sys.modules['telegram'] = MagicMock()
+sys.modules['telegram.constants'] = MagicMock()
+sys.modules['telegram.ext'] = MagicMock()
+sys.modules['dotenv'] = MagicMock()
+
 import os
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 # Mock dependencies that might be missing for standard unit test run
 sys.modules["httpx"] = MagicMock()
