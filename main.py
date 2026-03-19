@@ -1020,10 +1020,9 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
                 )
             else:
-                await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {event_id})", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {html.escape(event_id)})", parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Error in fetch_and_send for {camera}: {e}", exc_info=True)
-            await update.effective_chat.send_message(f"⚠️ Error fetching video for {camera}: {str(e)}")
 
     # Note: This will take (duration + 5) seconds total as all tasks sleep in parallel
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
@@ -1235,13 +1234,13 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
                     if matched:
                         logger.info("Processing %d new event(s)", len(matched))
 
-                        async def _send_with_error_handling(event):
+                        async def send_safe(ev):
                             try:
-                                await send_event_notification(bot, event, http_client)
+                                await send_event_notification(bot, ev, http_client)
                             except Exception as e:
                                 logger.error("Fatal error processing event notification: %s", e)
 
-                        await asyncio.gather(*[_send_with_error_handling(ev) for ev in matched])
+                        await asyncio.gather(*[send_safe(ev) for ev in matched])
                         logger.info("All events processed.")
                     else:
                         logger.debug("No new matching events.")
