@@ -382,6 +382,40 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
             # Should still get events from the working camera
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["id"], "A")
-    
+
+class TestEventMatchesConfig(unittest.TestCase):
+    def test_event_matches_config(self):
+        # 1. Empty config
+        with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+            self.assertTrue(main.event_matches_config({"camera": "any"}))
+
+        # 2. Camera not in config
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"all"}}, clear=True):
+            self.assertFalse(main.event_matches_config({"camera": "back"}))
+
+        # 3. Camera in config, zone is 'all'
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"all"}}, clear=True):
+            self.assertTrue(main.event_matches_config({"camera": "front", "zones": ["driveway"]}))
+
+        # 4. Camera in config, matching zone
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway", "porch"}}, clear=True):
+            self.assertTrue(main.event_matches_config({"camera": "front", "zones": ["driveway"]}))
+
+        # 5. Camera in config, multiple event zones, one matching
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway", "porch"}}, clear=True):
+            self.assertTrue(main.event_matches_config({"camera": "front", "zones": ["street", "driveway"]}))
+
+        # 6. Camera in config, no matching zones
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway", "porch"}}, clear=True):
+            self.assertFalse(main.event_matches_config({"camera": "front", "zones": ["street"]}))
+
+        # 7. Missing camera field (defaults to "" in event.get)
+        with patch.dict(main.MONITOR_CONFIG, {"": {"all"}}, clear=True):
+            self.assertTrue(main.event_matches_config({"zones": ["any"]}))
+
+        # 8. Missing zones field (defaults to [])
+        with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway"}}, clear=True):
+            self.assertFalse(main.event_matches_config({"camera": "front"}))
+
 if __name__ == "__main__":
     unittest.main()
