@@ -10,11 +10,12 @@ sys.modules["dotenv"] = MagicMock()
 
 import unittest
 import json
+import logging
 from pathlib import Path
 from unittest.mock import patch
 import main
 
-class TestNotificationState(unittest.TestCase):
+class TestNotificationState(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.test_path = Path("test_state.json")
         if self.test_path.exists():
@@ -52,6 +53,16 @@ class TestNotificationState(unittest.TestCase):
             self.test_path.touch()
             state = main.NotificationState(self.test_path)
             self.assertTrue(state.enabled)
+
+    async def test_save_io_error(self):
+        # Patch write_text to raise an exception during _save
+        state = main.NotificationState(self.test_path)
+        with patch.object(Path, "write_text", side_effect=OSError("Write error")):
+            with self.assertLogs("frigate-telegram", level="WARNING") as cm:
+                await state._save()
+                self.assertTrue(any("Could not persist state file" in output for output in cm.output))
+        # Ensure the test didn't crash and we reached here
+        self.assertTrue(True)
 
 if __name__ == "__main__":
     unittest.main()
