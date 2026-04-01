@@ -272,6 +272,7 @@ async def fetch_media_with_retry(
     url: str,
     label: str,
     expected_content_type: str | None = None,
+    max_retries: int = MAX_RETRIES,
 ) -> bytes | None:
     """Fetch media from a URL with retry logic for 404/transient errors.
 
@@ -280,11 +281,12 @@ async def fetch_media_with_retry(
         label: Human-readable label for logging (e.g. 'preview.gif for event X').
         expected_content_type: If set, warn when the response Content-Type
             doesn't match (helps detect octet-stream issues).
+        max_retries: Maximum number of attempts.
 
     Returns:
         Raw bytes or None if all retries failed.
     """
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             resp = await client.get(url, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
 
@@ -294,20 +296,20 @@ async def fetch_media_with_retry(
         except httpx.HTTPStatusError as exc:
             if resp.status_code == 404:
                 # 404 means Frigate hasn't generated the media yet — retry
-                if attempt < MAX_RETRIES:
-                    logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, MAX_RETRIES)
+                if attempt < max_retries:
+                    logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, max_retries)
                 else:
-                    logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, MAX_RETRIES, mask_url(url))
+                    logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, max_retries, mask_url(url))
             else:
                 logger.error("%s: HTTP error %d: %s. URL: %s", label, resp.status_code, exc, mask_url(url))
             
-            if attempt < MAX_RETRIES:
+            if attempt < max_retries:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
             return None
         except httpx.RequestError as exc:
             logger.error("%s: Network error: %s", label, exc)
-            if attempt < MAX_RETRIES:
+            if attempt < max_retries:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
             return None
@@ -320,7 +322,7 @@ async def fetch_media_with_retry(
             # Verify basic response validity
             if len(resp.content) < 100:
                 logger.warning("%s: response too small (%d bytes), retrying", label, len(resp.content))
-                if attempt < MAX_RETRIES:
+                if attempt < max_retries:
                     await asyncio.sleep(RETRY_DELAY)
                     continue
                 return None
@@ -344,17 +346,19 @@ async def _fetch_frigate_api(
     path: str,
     label: str,
     expected_content_type: str | None = None,
+    max_retries: int = MAX_RETRIES,
 ) -> bytes | None:
     """Internal helper to fetch from Frigate API."""
     url = f"{FRIGATE_URL}/api/{path}"
-    return await fetch_media_with_retry(client, url, label, expected_content_type)
+    return await fetch_media_with_retry(client, url, label, expected_content_type, max_retries=max_retries)
 
 
 async def fetch_event_details(client: httpx.AsyncClient, event_id: str) -> dict | None:
     """Fetch full event details from Frigate API."""
     try:
+        safe_event_id = urllib.parse.quote(event_id, safe='')
         resp = await client.get(
-            f"{FRIGATE_URL}/api/events/{event_id}",
+            f"{FRIGATE_URL}/api/events/{safe_event_id}",
             auth=_http_auth(),
             timeout=FRIGATE_TIMEOUT,
         )
@@ -369,20 +373,25 @@ async def fetch_event_media(
     client: httpx.AsyncClient,
     event_id: str,
     media_type: Literal["gif", "clip", "thumbnail"],
+    max_retries: int = MAX_RETRIES,
 ) -> bytes | None:
     """Fetch event-related media (gif, clip, or thumbnail)."""
+    safe_event_id = urllib.parse.quote(event_id, safe='')
     filename, content_type = EVENT_MEDIA_CONFIG[media_type]
     return await _fetch_frigate_api(
         client,
-        f"events/{event_id}/{filename}",
+        f"events/{safe_event_id}/{filename}",
         f"{filename} for {event_id}",
         content_type,
+        max_retries=max_retries,
     )
 
 
 
 
-async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes | None:
+async def fetch_camera_snapshot(
+    client: httpx.AsyncClient, camera: str, max_retries: int = MAX_RETRIES
+) -> bytes | None:
     """Fetch the latest snapshot JPEG from a camera."""
     safe_camera = urllib.parse.quote(camera, safe='')
     return await _fetch_frigate_api(
@@ -390,25 +399,40 @@ async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes
         f"{safe_camera}/latest.jpg?bbox=1",
         f"latest.jpg for {camera}",
         "image/jpeg",
+        max_retries=max_retries,
     )
 
 
+_CACHED_CAMERAS: list[str] | None = None
+
+
 async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
-    """Fetch the list of camera names from Frigate API."""
+    """Fetch the list of camera names from Frigate API.
+    Result is cached after the first successful fetch.
+    """
+    global _CACHED_CAMERAS
+    if _CACHED_CAMERAS is not None:
+        return _CACHED_CAMERAS
+
     try:
         # /api/config contains the full configuration including cameras
         resp = await client.get(f"{FRIGATE_URL}/api/config", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         resp.raise_for_status()
         config = resp.json()
         cameras = list(config.get("cameras", {}).keys())
-        return sorted(cameras)
+        _CACHED_CAMERAS = sorted(cameras)
+        return _CACHED_CAMERAS
     except Exception as exc:
         logger.error("Error fetching camera list: %s", exc)
         return []
 
 
 async def fetch_recording_clip(
-    client: httpx.AsyncClient, camera: str, start_ts: int, end_ts: int
+    client: httpx.AsyncClient,
+    camera: str,
+    start_ts: int,
+    end_ts: int,
+    max_retries: int = MAX_RETRIES,
 ) -> bytes | None:
     """Fetch a recording clip for a specific time range."""
     # Frigate API: /api/<camera_name>/start/<start_ts>/end/<end_ts>/clip.mp4
@@ -418,6 +442,7 @@ async def fetch_recording_clip(
         f"{safe_camera}/start/{start_ts}/end/{end_ts}/clip.mp4",
         f"clip.mp4 for {camera} ({start_ts}-{end_ts})",
         "video/mp4",
+        max_retries=max_retries,
     )
 
 
@@ -459,7 +484,7 @@ async def fetch_video_data_robust(
     # 1. Try pre-generated event clip
     if event_id:
         # Retry loop for new events that might still be processing
-        for i in range(5):
+        for _ in range(5):
             data = await fetch_event_media(client, event_id, "clip")
             if data:
                 return data
@@ -534,13 +559,20 @@ def event_matches_config(event: dict) -> bool:
 # ─────────────────────── Caption Formatting ──────────────────────────
 
 
+try:
+    _CACHED_TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    _CACHED_TZ = timezone.utc
+
 def _epoch_to_datetime(epoch: float | None) -> str:
     """Convert epoch timestamp to a human-readable datetime string."""
     if epoch is None or epoch == 0:
         return "N/A"
     try:
-        tz = ZoneInfo(TIMEZONE)
-        dt = datetime.fromtimestamp(epoch, tz=tz)
+        dt = datetime.fromtimestamp(epoch, tz=_CACHED_TZ)
+        # Use explicit "UTC" for timezone.utc to maintain exact backwards compatibility in formatting
+        if _CACHED_TZ is timezone.utc:
+            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -654,21 +686,21 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 
     caption = format_caption(event)
 
-    # ── Fetch all media in parallel ──────────────────────────────────
-    gif_task = asyncio.create_task(fetch_event_media(http_client, event_id, "gif"))
-    thumb_task = asyncio.create_task(fetch_event_media(http_client, event_id, "thumbnail"))
-    snap_task = asyncio.create_task(fetch_camera_snapshot(http_client, camera))
-    clip_task = (
-        asyncio.create_task(fetch_event_media(http_client, event_id, "clip"))
-        if SEND_CLIP
-        else None
-    )
+    # ── Fetch media sequentially based on priority ────────────────────
+    clip_data = None
+    gif_data = None
+    photo_data = None
 
-    gif_data, thumb_data, snap_data = await asyncio.gather(gif_task, thumb_task, snap_task)
-    clip_data = await clip_task if clip_task else None
+    if SEND_CLIP:
+        clip_data = await fetch_event_media(http_client, event_id, "clip")
 
-    # Choose the best available photo (snapshot is higher quality than thumbnail)
-    photo_data = snap_data or thumb_data
+    if not clip_data:
+        gif_data = await fetch_event_media(http_client, event_id, "gif")
+
+    # Fetch thumbnail to use as preview for video/gif, or as fallback photo
+    photo_data = await fetch_camera_snapshot(http_client, camera)
+    if not photo_data:
+        photo_data = await fetch_event_media(http_client, event_id, "thumbnail")
 
     try:
         if SEND_CLIP and clip_data:
