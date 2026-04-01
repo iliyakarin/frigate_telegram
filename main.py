@@ -442,7 +442,7 @@ async def fetch_video_data_robust(
     # 1. Try pre-generated event clip
     if event_id:
         # Retry loop for new events that might still be processing
-        for i in range(5):
+        for _ in range(5):
             data = await fetch_event_media(client, event_id, "clip")
             if data:
                 return data
