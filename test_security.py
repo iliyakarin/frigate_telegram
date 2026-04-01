@@ -10,7 +10,7 @@ sys.modules['dotenv'] = MagicMock()
 
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 # Mock dependencies that might be missing for standard unit test run
 sys.modules["httpx"] = MagicMock()
