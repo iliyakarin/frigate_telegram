@@ -64,6 +64,23 @@ def get_bool_setting(key: str, default: bool) -> bool:
         return default
     return val.lower() in ("true", "1", "yes", "on")
 
+
+def mask_url(url: str) -> str:
+    """Mask a URL to show only the scheme and host, removing credentials and path."""
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return url
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{parsed.scheme}://{host}"
+    except Exception:
+        return "[redacted]"
+
+
 MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
 
 POLLING_INTERVAL = get_int_setting("POLLING_INTERVAL", 60)
@@ -205,7 +222,7 @@ async def check_frigate_status(client: httpx.AsyncClient) -> bool:
         logger.info("Frigate is up — version: %s", resp.text.strip())
         return True
     except Exception as exc:
-        logger.error("Cannot reach Frigate at %s: %s", FRIGATE_URL, exc)
+        logger.error("Cannot reach Frigate at %s: %s", mask_url(FRIGATE_URL), exc)
         return False
 
 
@@ -272,7 +289,7 @@ async def fetch_media_with_retry(
             resp = await client.get(url, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
 
             if DEBUG:
-                logger.debug("Fetching Frigate API: %s %s", resp.status_code, url)
+                logger.debug("Fetching Frigate API: %s %s", resp.status_code, mask_url(url))
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if resp.status_code == 404:
@@ -280,9 +297,9 @@ async def fetch_media_with_retry(
                 if attempt < MAX_RETRIES:
                     logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, MAX_RETRIES)
                 else:
-                    logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, MAX_RETRIES, url)
+                    logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, MAX_RETRIES, mask_url(url))
             else:
-                logger.error("%s: HTTP error %d: %s. URL: %s", label, resp.status_code, exc, url)
+                logger.error("%s: HTTP error %d: %s. URL: %s", label, resp.status_code, exc, mask_url(url))
             
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY)
@@ -295,7 +312,7 @@ async def fetch_media_with_retry(
                 continue
             return None
         except Exception as exc:
-            logger.error("%s: Unexpected error fetching %s: %s", label, url, exc)
+            logger.error("%s: Unexpected error fetching %s: %s", label, mask_url(url), exc)
             return None
 
         # Success path
@@ -479,7 +496,7 @@ async def trigger_manual_event(
         params = {"include_recording": "1", "duration": str(duration)}
         
         if DEBUG:
-            logger.debug("Triggering manual event: %s params=%s", url, params)
+            logger.debug("Triggering manual event: %s params=%s", mask_url(url), params)
 
         resp = await client.post(url, params=params, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         resp.raise_for_status()
@@ -799,8 +816,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>Monitored Cameras:</b> 🎥 {html.escape(cameras)}",
         "",
         "🛠 <b>Configuration</b>",
-        f"<b>Frigate URL:</b> 🔗 {html.escape(FRIGATE_URL)}",
-        f"<b>External URL:</b> 🌐 {html.escape(EXTERNAL_URL) if EXTERNAL_URL else 'Not configured'}",
+        f"<b>Frigate URL:</b> 🔗 {html.escape(mask_url(FRIGATE_URL))}",
+        f"<b>External URL:</b> 🌐 {html.escape(mask_url(EXTERNAL_URL)) if EXTERNAL_URL else 'Not configured'}",
         f"<b>Frigate Timeout:</b> ⏳ {FRIGATE_TIMEOUT}s",
         f"<b>Upload Timeout:</b> 📤 {UPLOAD_TIMEOUT}s",
     ]
@@ -1283,8 +1300,8 @@ async def main() -> None:
         sys.exit(1)
 
     logger.info("=== Frigate-Telegram Bot Starting ===")
-    logger.info("Frigate URL: %s", FRIGATE_URL)
-    logger.info("External URL: %s", EXTERNAL_URL or "not configured")
+    logger.info("Frigate URL: %s", mask_url(FRIGATE_URL))
+    logger.info("External URL: %s", mask_url(EXTERNAL_URL) or "not configured")
     logger.info("Monitor config: %s", MONITOR_CONFIG if MONITOR_CONFIG else "all cameras/zones")
     logger.info("Polling interval: %ds", POLLING_INTERVAL)
     logger.info("Frigate timeout: %ds", FRIGATE_TIMEOUT)

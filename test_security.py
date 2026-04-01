@@ -110,5 +110,26 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(main.state.enabled)
         update.effective_chat.send_message.assert_called_with("🔕 Notifications disabled.")
 
+    def test_mask_url(self):
+        # Test basic URL
+        self.assertEqual(main.mask_url("http://localhost:5000"), "http://localhost:5000")
+
+        # Test URL with path
+        self.assertEqual(main.mask_url("http://localhost:5000/api/events"), "http://localhost:5000")
+
+        # Test URL with credentials and path
+        self.assertEqual(main.mask_url("http://user:pass@localhost:5000/api/events"), "http://localhost:5000")
+
+        # Test HTTPS with port
+        self.assertEqual(main.mask_url("https://example.com:8443/some/path?query=1"), "https://example.com:8443")
+
+        # Test empty/None
+        self.assertEqual(main.mask_url(""), "")
+        self.assertEqual(main.mask_url(None), "")
+
+        # Test malformed URL
+        # urllib.parse.urlparse might not raise for some malformed strings but it will return empty scheme/netloc
+        self.assertEqual(main.mask_url("not_a_url"), "not_a_url")
+
 if __name__ == "__main__":
     unittest.main()
