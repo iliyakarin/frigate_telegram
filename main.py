@@ -376,15 +376,25 @@ async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes
     )
 
 
+_CACHED_CAMERAS: list[str] | None = None
+
+
 async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
-    """Fetch the list of camera names from Frigate API."""
+    """Fetch the list of camera names from Frigate API.
+    Result is cached after the first successful fetch.
+    """
+    global _CACHED_CAMERAS
+    if _CACHED_CAMERAS is not None:
+        return _CACHED_CAMERAS
+
     try:
         # /api/config contains the full configuration including cameras
         resp = await client.get(f"{FRIGATE_URL}/api/config", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         resp.raise_for_status()
         config = resp.json()
         cameras = list(config.get("cameras", {}).keys())
-        return sorted(cameras)
+        _CACHED_CAMERAS = sorted(cameras)
+        return _CACHED_CAMERAS
     except Exception as exc:
         logger.error("Error fetching camera list: %s", exc)
         return []
