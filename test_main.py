@@ -193,10 +193,24 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_trigger.assert_called_once()
         # Should be called multiple times due to retry
         self.assertEqual(mock_media.call_count, 3) 
-        mock_media.assert_called_with(context.bot_data["http_client"], "evt_123", "clip")
+        mock_media.assert_called_with(context.bot_data["http_client"], "evt_123", "clip", max_retries=1)
         
         # Ensure we sent a video via effective_chat
         update.effective_chat.send_video.assert_called_once()
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_event_details")
+    @patch("main.fetch_recording_clip")
+    @patch("asyncio.sleep", return_value=None)
+    async def test_fetch_video_data_robust_max_retries_propagate(self, mock_sleep, mock_recording, mock_details, mock_media):
+        """Test fetch_video_data_robust propagates max_retries=1 to fetch_event_media."""
+        client = MagicMock()
+        mock_media.return_value = b"event_clip"
+
+        await main.fetch_video_data_robust(client, "cam1", "evt1")
+
+        # Verify it was called with max_retries=1
+        mock_media.assert_called_with(client, "evt1", "clip", max_retries=1)
 
     @patch("main.get_camera_selection_menu")
     async def test_cmd_video_menu(self, mock_get_menu):
