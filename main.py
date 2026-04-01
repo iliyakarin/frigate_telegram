@@ -517,13 +517,20 @@ def event_matches_config(event: dict) -> bool:
 # ─────────────────────── Caption Formatting ──────────────────────────
 
 
+try:
+    _CACHED_TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    _CACHED_TZ = timezone.utc
+
 def _epoch_to_datetime(epoch: float | None) -> str:
     """Convert epoch timestamp to a human-readable datetime string."""
     if epoch is None or epoch == 0:
         return "N/A"
     try:
-        tz = ZoneInfo(TIMEZONE)
-        dt = datetime.fromtimestamp(epoch, tz=tz)
+        dt = datetime.fromtimestamp(epoch, tz=_CACHED_TZ)
+        # Use explicit "UTC" for timezone.utc to maintain exact backwards compatibility in formatting
+        if _CACHED_TZ is timezone.utc:
+            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     except Exception:
         return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
