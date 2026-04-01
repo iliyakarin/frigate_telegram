@@ -637,21 +637,21 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
 
     caption = format_caption(event)
 
-    # ── Fetch all media in parallel ──────────────────────────────────
-    gif_task = asyncio.create_task(fetch_event_media(http_client, event_id, "gif"))
-    thumb_task = asyncio.create_task(fetch_event_media(http_client, event_id, "thumbnail"))
-    snap_task = asyncio.create_task(fetch_camera_snapshot(http_client, camera))
-    clip_task = (
-        asyncio.create_task(fetch_event_media(http_client, event_id, "clip"))
-        if SEND_CLIP
-        else None
-    )
+    # ── Fetch media sequentially based on priority ────────────────────
+    clip_data = None
+    gif_data = None
+    photo_data = None
 
-    gif_data, thumb_data, snap_data = await asyncio.gather(gif_task, thumb_task, snap_task)
-    clip_data = await clip_task if clip_task else None
+    if SEND_CLIP:
+        clip_data = await fetch_event_media(http_client, event_id, "clip")
 
-    # Choose the best available photo (snapshot is higher quality than thumbnail)
-    photo_data = snap_data or thumb_data
+    if not clip_data:
+        gif_data = await fetch_event_media(http_client, event_id, "gif")
+
+    # Fetch thumbnail to use as preview for video/gif, or as fallback photo
+    photo_data = await fetch_camera_snapshot(http_client, camera)
+    if not photo_data:
+        photo_data = await fetch_event_media(http_client, event_id, "thumbnail")
 
     try:
         if SEND_CLIP and clip_data:
