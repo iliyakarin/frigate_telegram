@@ -376,17 +376,35 @@ async def fetch_camera_snapshot(client: httpx.AsyncClient, camera: str) -> bytes
     )
 
 
+_CACHED_CAMERAS: tuple[float, list[str]] | None = None
+_CAMERA_CACHE_TTL = 300  # 5 minutes in seconds
+
 async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
     """Fetch the list of camera names from Frigate API."""
+    global _CACHED_CAMERAS
+
+    # Check if we have a valid cache
+    if _CACHED_CAMERAS is not None:
+        cache_time, cached_list = _CACHED_CAMERAS
+        if time.time() - cache_time < _CAMERA_CACHE_TTL:
+            return cached_list
+
     try:
         # /api/config contains the full configuration including cameras
         resp = await client.get(f"{FRIGATE_URL}/api/config", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         resp.raise_for_status()
         config = resp.json()
         cameras = list(config.get("cameras", {}).keys())
-        return sorted(cameras)
+        sorted_cameras = sorted(cameras)
+
+        # Update cache
+        _CACHED_CAMERAS = (time.time(), sorted_cameras)
+        return sorted_cameras
     except Exception as exc:
         logger.error("Error fetching camera list: %s", exc)
+        # Fall back to stale cache if available
+        if _CACHED_CAMERAS is not None:
+            return _CACHED_CAMERAS[1]
         return []
 
 
