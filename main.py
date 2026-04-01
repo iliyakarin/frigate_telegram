@@ -336,8 +336,9 @@ async def _fetch_frigate_api(
 async def fetch_event_details(client: httpx.AsyncClient, event_id: str) -> dict | None:
     """Fetch full event details from Frigate API."""
     try:
+        safe_event_id = urllib.parse.quote(event_id, safe='')
         resp = await client.get(
-            f"{FRIGATE_URL}/api/events/{event_id}",
+            f"{FRIGATE_URL}/api/events/{safe_event_id}",
             auth=_http_auth(),
             timeout=FRIGATE_TIMEOUT,
         )
@@ -354,10 +355,11 @@ async def fetch_event_media(
     media_type: Literal["gif", "clip", "thumbnail"],
 ) -> bytes | None:
     """Fetch event-related media (gif, clip, or thumbnail)."""
+    safe_event_id = urllib.parse.quote(event_id, safe='')
     filename, content_type = EVENT_MEDIA_CONFIG[media_type]
     return await _fetch_frigate_api(
         client,
-        f"events/{event_id}/{filename}",
+        f"events/{safe_event_id}/{filename}",
         f"{filename} for {event_id}",
         content_type,
     )
