@@ -102,6 +102,13 @@ MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)  # seconds to wait
 UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)  # seconds for Telegram media upload (tunnel-safe)
 SEND_CLIP = get_bool_setting("SEND_CLIP", False)  # send clip.mp4 instead of preview.gif for HD quality
 
+# Shared Telegram API timeout kwargs for consistent usage across all media/message sends
+TELEGRAM_TIMEOUT_KWARGS = {
+    "read_timeout": UPLOAD_TIMEOUT,
+    "write_timeout": UPLOAD_TIMEOUT,
+    "connect_timeout": TELEGRAM_CONNECT_TIMEOUT,
+}
+
 
 
 # Media types configuration: { key: (filename, content_type) }
@@ -713,9 +720,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 parse_mode=ParseMode.HTML,
                 filename="clip.mp4",
                 supports_streaming=True,
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
             logger.info("Event %s → sent HD video clip with caption ✓", event_id)
 
@@ -728,9 +733,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename="preview.gif",
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
             logger.info("Event %s → sent animation with caption ✓", event_id)
 
@@ -742,9 +745,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 filename="snapshot.jpg",
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
             logger.info("Event %s → sent photo with caption (GIF unavailable)", event_id)
 
@@ -754,8 +755,7 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 chat_id=TELEGRAM_CHAT_ID,
                 text=caption,
                 parse_mode=ParseMode.HTML,
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
             logger.info("Event %s → sent text only (no media available)", event_id)
 
@@ -946,9 +946,7 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         caption=f"📷 Snapshot: {html.escape(camera_name)}",
         parse_mode=ParseMode.HTML,
         filename=f"{camera_name}.jpg",
-        read_timeout=UPLOAD_TIMEOUT,
-        write_timeout=UPLOAD_TIMEOUT,
-        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+        **TELEGRAM_TIMEOUT_KWARGS,
     )
 
 
@@ -969,9 +967,7 @@ async def cmd_photo_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 caption=f"📷 Snapshot: {html.escape(camera)}",
                 parse_mode=ParseMode.HTML,
                 filename=f"{camera}.jpg",
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
         else:
             await update.effective_chat.send_message(f"❌ Failed to fetch snapshot for <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
@@ -1022,9 +1018,7 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
             filename=f"{camera_name}_{event_id if event_id else 'manual'}.mp4",
             supports_streaming=True,
-            read_timeout=UPLOAD_TIMEOUT,
-            write_timeout=UPLOAD_TIMEOUT,
-            connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+            **TELEGRAM_TIMEOUT_KWARGS,
         )
     except Exception as e:
         logger.error(f"Error in cmd_video for {camera_name}: {e}", exc_info=True)
@@ -1064,9 +1058,7 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     parse_mode=ParseMode.HTML,
                     filename=f"{camera}_{event_id}.mp4",
                     supports_streaming=True,
-                    read_timeout=UPLOAD_TIMEOUT,
-                    write_timeout=UPLOAD_TIMEOUT,
-                    connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                    **TELEGRAM_TIMEOUT_KWARGS,
                 )
             else:
                 await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {html.escape(event_id)})", parse_mode=ParseMode.HTML)
@@ -1116,9 +1108,7 @@ async def cmd_video_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode=ParseMode.HTML,
         filename=f"{camera_name}_last.mp4",
         supports_streaming=True,
-        read_timeout=UPLOAD_TIMEOUT,
-        write_timeout=UPLOAD_TIMEOUT,
-        connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+        **TELEGRAM_TIMEOUT_KWARGS,
     )
 
 
@@ -1156,9 +1146,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode=ParseMode.HTML,
                 filename=f"{camera}_last.mp4",
                 supports_streaming=True,
-                read_timeout=UPLOAD_TIMEOUT,
-                write_timeout=UPLOAD_TIMEOUT,
-                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                **TELEGRAM_TIMEOUT_KWARGS,
             )
         else:
             await update.effective_chat.send_message(f"❌ Failed to fetch video for any of the last {len(events)} events on <code>{html.escape(camera)}</code>", parse_mode=ParseMode.HTML)
