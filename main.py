@@ -293,6 +293,8 @@ async def fetch_media_with_retry(
     Returns:
         Raw bytes or None if all retries failed.
     """
+    expected_ct_lower = expected_content_type.lower() if expected_content_type else None
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = await client.get(url, auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
@@ -336,7 +338,7 @@ async def fetch_media_with_retry(
 
             # Verify content type if expected
             ct = resp.headers.get("content-type", "").lower()
-            if expected_content_type and expected_content_type.lower() not in ct:
+            if expected_ct_lower and expected_ct_lower not in ct:
                 logger.warning("%s: expected %s, got %s", label, expected_content_type, ct)
 
             logger.debug("Fetched %s: %d bytes", label, len(resp.content))
