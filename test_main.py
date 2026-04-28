@@ -243,6 +243,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
     async def test_button_handler_logic(self, mock_cam_menu, mock_main_menu, mock_cmd_photo, mock_cmd_photo_all):
         """Test the new button_handler navigation and command logic."""
         update = MagicMock()
+        update.effective_chat.id = os.environ.get("TELEGRAM_CHAT_ID")
         update.callback_query = AsyncMock()
         update.effective_chat.id = "fake"
         context = MagicMock()
