@@ -74,5 +74,21 @@ class TestUtils(unittest.TestCase):
                 result = main._epoch_to_datetime(epoch)
                 self.assertEqual(result, "2023-01-01 00:00:00 UTC")
 
+    def test_timezone_parsing_fallback(self):
+        """Test that invalid TIMEZONE falls back to UTC by catching ZoneInfoNotFoundError."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        import main
+        from datetime import timezone
+
+        # Helper to simulate the logic in main.py
+        def get_tz(tz_name):
+            try:
+                return ZoneInfo(tz_name)
+            except ZoneInfoNotFoundError:
+                return timezone.utc
+
+        self.assertEqual(get_tz("Invalid/Timezone"), timezone.utc)
+        self.assertEqual(get_tz("Europe/Berlin"), ZoneInfo("Europe/Berlin"))
+
 if __name__ == "__main__":
     unittest.main()

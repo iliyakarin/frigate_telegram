@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Literal
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -570,7 +570,7 @@ def event_matches_config(event: dict) -> bool:
 
 try:
     _CACHED_TZ = ZoneInfo(TIMEZONE)
-except Exception:
+except ZoneInfoNotFoundError:
     _CACHED_TZ = timezone.utc
 
 def _epoch_to_datetime(epoch: float | None) -> str:
