@@ -1156,6 +1156,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
 
+@authorized_only
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle callback queries from inline keyboards."""
     query = update.callback_query
