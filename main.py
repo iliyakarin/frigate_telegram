@@ -145,7 +145,8 @@ def parse_monitor_config(raw: str) -> dict[str, set[str]]:
 
     If the string is empty, returns an empty dict (= monitor everything).
     """
-    if not raw.strip():
+    raw = raw.strip()
+    if not raw:
         return {}
 
     config: dict[str, set[str]] = {}
@@ -153,13 +154,18 @@ def parse_monitor_config(raw: str) -> dict[str, set[str]]:
         entry = entry.strip()
         if not entry:
             continue
-        if ":" in entry:
-            camera, zones_str = entry.split(":", 1)
-            zones = {z.strip() for z in zones_str.split(",") if z.strip()}
-            config[camera.strip()] = zones if zones else {"all"}
+
+        camera_part, sep, zones_part = entry.partition(":")
+        camera = camera_part.strip()
+        if not camera:
+            continue
+
+        if sep:
+            zones = {z.strip() for z in zones_part.split(",") if z.strip()}
+            config[camera] = zones if zones else {"all"}
         else:
             # Camera name without zones → monitor all zones
-            config[entry.strip()] = {"all"}
+            config[camera] = {"all"}
     return config
 
 
