@@ -244,6 +244,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         """Test the new button_handler navigation and command logic."""
         update = MagicMock()
         update.callback_query = AsyncMock()
+        update.effective_chat.id = "fake"
         context = MagicMock()
         context.bot_data = {"http_client": MagicMock()}
 

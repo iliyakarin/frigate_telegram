@@ -494,7 +494,7 @@ async def fetch_video_data_robust(
     if event_id:
         # Retry loop for new events that might still be processing
         for _ in range(5):
-            data = await fetch_event_media(client, event_id, "clip")
+            data = await fetch_event_media(client, event_id, "clip", max_retries=1)
             if data:
                 return data
             await asyncio.sleep(2)
@@ -1156,6 +1156,7 @@ async def cmd_video_all_last(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
 
 
+@authorized_only
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle callback queries from inline keyboards."""
     query = update.callback_query
