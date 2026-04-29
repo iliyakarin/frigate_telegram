@@ -10,7 +10,7 @@ sys.modules['dotenv'] = MagicMock()
 
 import os
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 # Mock dependencies that might be missing for standard unit test run
 sys.modules["httpx"] = MagicMock()
@@ -89,7 +89,8 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
         update = self.create_mock_update(12345)
         context = MagicMock()
 
-        await main.cmd_enable(update, context)
+        with patch("main.TELEGRAM_CHAT_ID", "12345"):
+            await main.cmd_enable(update, context)
 
         # Verify it WAS enabled
         self.assertTrue(main.state.enabled)
@@ -104,7 +105,8 @@ class TestSecurity(unittest.IsolatedAsyncioTestCase):
         update = self.create_mock_update(12345)
         context = MagicMock()
 
-        await main.cmd_disable(update, context)
+        with patch("main.TELEGRAM_CHAT_ID", "12345"):
+            await main.cmd_disable(update, context)
 
         # Verify it WAS disabled
         self.assertFalse(main.state.enabled)
