@@ -195,7 +195,9 @@ class NotificationState:
     async def _save(self) -> None:
         def _do_save():
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps({"enabled": self._enabled}))
+            tmp_path = self._path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps({"enabled": self._enabled}))
+            tmp_path.replace(self._path)
 
         try:
             loop = asyncio.get_running_loop()
@@ -309,14 +311,14 @@ async def fetch_media_with_retry(
                 logger.debug("Fetching Frigate API: %s %s", resp.status_code, mask_url(url))
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            if resp.status_code == 404:
+            if exc.response.status_code == 404:
                 # 404 means Frigate hasn't generated the media yet — retry
                 if attempt < max_retries:
                     logger.debug("%s: media not ready (404), retry %d/%d", label, attempt, max_retries)
                 else:
                     logger.warning("%s: media not found (404) after %d attempts. URL: %s", label, max_retries, mask_url(url))
             else:
-                logger.error("%s: HTTP error %d: %s. URL: %s", label, resp.status_code, exc, mask_url(url))
+                logger.error("%s: HTTP error %d: %s. URL: %s", label, exc.response.status_code, exc, mask_url(url))
             
             if attempt < max_retries:
                 await asyncio.sleep(RETRY_DELAY)
@@ -419,14 +421,17 @@ async def fetch_camera_snapshot(
 
 
 _CACHED_CAMERAS: list[str] | None = None
+_CACHED_CAMERAS_TIMESTAMP: float = 0
+_CAMERA_CACHE_TTL: int = 300
 
 
 async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
     """Fetch the list of camera names from Frigate API.
-    Result is cached after the first successful fetch.
+    Result is cached with a TTL.
     """
-    global _CACHED_CAMERAS
-    if _CACHED_CAMERAS is not None:
+    global _CACHED_CAMERAS, _CACHED_CAMERAS_TIMESTAMP
+    now = time.time()
+    if _CACHED_CAMERAS is not None and (now - _CACHED_CAMERAS_TIMESTAMP) < _CAMERA_CACHE_TTL:
         return _CACHED_CAMERAS
 
     try:
@@ -436,10 +441,11 @@ async def fetch_camera_list(client: httpx.AsyncClient) -> list[str]:
         config = resp.json()
         cameras = list(config.get("cameras", {}).keys())
         _CACHED_CAMERAS = sorted(cameras)
+        _CACHED_CAMERAS_TIMESTAMP = now
         return _CACHED_CAMERAS
     except Exception as exc:
         logger.error("Error fetching camera list: %s", exc)
-        return []
+        return _CACHED_CAMERAS if _CACHED_CAMERAS is not None else []
 
 
 async def fetch_recording_clip(
@@ -1305,6 +1311,7 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
             else:
                 logger.debug("Notifications disabled — skipping poll.")
                 current_interval = POLLING_INTERVAL # Reset interval while disabled
+                last_poll_ts = time.time()
         except Exception as exc:
             logger.error("Critical failure in polling loop: %s", exc, exc_info=True)
 
