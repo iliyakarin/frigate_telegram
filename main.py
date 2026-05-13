@@ -1035,8 +1035,11 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             **TELEGRAM_TIMEOUT_KWARGS,
         )
     except Exception as e:
-        logger.error(f"Error in cmd_video for {camera_name}: {e}", exc_info=True)
-        await update.effective_chat.send_message(f"⚠️ Error recording video for {camera_name}: {str(e)}")
+        logger.error(f"Error in cmd_video for {camera_name}: {e}", exc_info=DEBUG)
+        await update.effective_chat.send_message(
+            f"⚠️ An error occurred while recording the video for {html.escape(camera_name)}.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @authorized_only
@@ -1077,7 +1080,7 @@ async def cmd_video_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             else:
                 await update.effective_chat.send_message(f"❌ Failed to fetch video clip for <code>{html.escape(camera)}</code> (Event {html.escape(event_id)})", parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Error in fetch_and_send for {camera}: {e}", exc_info=True)
+            logger.error(f"Error in fetch_and_send for {camera}: {e}", exc_info=DEBUG)
 
     # Note: This will take (duration + 5) seconds total as all tasks sleep in parallel
     await asyncio.gather(*[fetch_and_send(cam) for cam in cameras])
@@ -1313,7 +1316,7 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
                 current_interval = POLLING_INTERVAL # Reset interval while disabled
                 last_poll_ts = time.time()
         except Exception as exc:
-            logger.error("Critical failure in polling loop: %s", exc, exc_info=True)
+            logger.error("Critical failure in polling loop: %s", exc, exc_info=DEBUG)
 
         await asyncio.sleep(current_interval)
 
