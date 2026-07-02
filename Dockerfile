@@ -16,7 +16,7 @@ WORKDIR /app
 
 # Copy only the installed site-packages from the builder
 COPY --from=builder /install /usr/local
-COPY main.py .
+COPY main.py grouping.py .
 
 # Create data dir with correct ownership
 RUN mkdir -p /app/data && chown -R appuser:appuser /app
