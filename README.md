@@ -1,19 +1,20 @@
 # 🔔 Frigate-Telegram
 
-A Python bot that polls [Frigate NVR](https://frigate.video/) for detection events and sends rich notifications to Telegram — **one message per event** with an animated GIF preview, face recognition, and full event details.
+A Python bot that polls [Frigate NVR](https://frigate.video/) for detection events and sends rich notifications to Telegram — **one message per activity**, spanning brief pauses so one visit doesn't fragment into several short clips, with a full HD video, face recognition, and full event details.
 
 > Inspired by [lucad87/frigate-telegram](https://github.com/lucad87/frigate-telegram), rebuilt from scratch in Python 3.11+ with modern async patterns and multi-camera support.
 
 ## ✨ Features
 
-- **Single-message delivery** — GIF animation + event details in one Telegram message (no spam)
+- **Single-message delivery** — full HD video clip + event details in one Telegram message (no spam)
+- **Event grouping** — merges rapid-fire Frigate events on the same camera into one notification spanning the whole activity, sent in chronological order, instead of several short out-of-order clips (`EVENT_MERGE_GAP`, `MAX_EVENT_SPAN`)
 - **Face recognition** — displays recognized names from Frigate's `sub_label` field
 - **Multi-camera matrix** — monitor specific cameras and zones via `MONITOR_CONFIG`
 - **Cloudflare Tunnel support** — `EXTERNAL_URL` for secure public event links
 - **Toggle notifications** — `/enable`, `/disable`, `/status`, and `/help` commands
 - **Persistent state** — notification toggle survives container restarts (JSON file)
 - **Retry logic** — automatically retries media fetches if Frigate hasn't generated them yet
-- **Graceful fallback** — GIF → snapshot → thumbnail → text-only if media isn't available
+- **Graceful fallback** — HD video → snapshot → text-only if media isn't available
 - **Tunnel-safe timeouts** — configurable `UPLOAD_TIMEOUT` for slow connections
 - **Optimized Docker image** — slim Python base, ~60MB
 
@@ -54,7 +55,8 @@ docker compose logs -f
 | `FRIGATE_USERNAME` | ❌ | — | Basic auth username (if Frigate auth is enabled) |
 | `FRIGATE_PASSWORD` | ❌ | — | Basic auth password |
 | `POLLING_INTERVAL` | ❌ | `60` | Seconds between polls |
-| `MEDIA_WAIT_TIMEOUT` | ❌ | `5` | Seconds to wait before fetching media (lets Frigate generate previews) |
+| `EVENT_MERGE_GAP` | ❌ | `45` | Seconds of quiet before finalizing a notification — related activity on the same camera within this gap gets merged into one message |
+| `MAX_EVENT_SPAN` | ❌ | `300` | Hard cap (seconds) on a merged notification's duration, so continuously recurring activity still gets sent eventually |
 | `UPLOAD_TIMEOUT` | ❌ | `60` | Seconds for Telegram upload timeout (increase for slow tunnels) |
 | `TIMEZONE` | ❌ | `UTC` | Timezone for timestamps (e.g. `America/Chicago`) |
 | `LOCALES` | ❌ | `en-US` | Locale for date formatting |
@@ -186,7 +188,8 @@ services:
       - TELEGRAM_CHAT_ID=-1001234567890
       - MONITOR_CONFIG={"front_door": ["yard", "driveway"], "back_camera": ["all"]}
       - POLLING_INTERVAL=60
-      - MEDIA_WAIT_TIMEOUT=5
+      - EVENT_MERGE_GAP=45
+      - MAX_EVENT_SPAN=300
       - UPLOAD_TIMEOUT=60
       - TIMEZONE=America/Chicago
       - DEBUG=false

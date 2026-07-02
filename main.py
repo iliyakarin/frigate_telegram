@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
+from grouping import PendingGroup, merge_into_pending, split_ready_groups
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
@@ -98,9 +99,13 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retry attempts
 FRIGATE_TIMEOUT = get_int_setting("FRIGATE_TIMEOUT", 15)  # seconds for Frigate API requests
 TELEGRAM_CONNECT_TIMEOUT = get_int_setting("TELEGRAM_CONNECT_TIMEOUT", 15)  # seconds for Telegram connection
-MEDIA_WAIT_TIMEOUT = get_int_setting("MEDIA_WAIT_TIMEOUT", 5)  # seconds to wait before fetching media
 UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)  # seconds for Telegram media upload (tunnel-safe)
-SEND_CLIP = get_bool_setting("SEND_CLIP", False)  # send clip.mp4 instead of preview.gif for HD quality
+
+# Event grouping settings — merge rapid-fire review items on the same camera
+# into a single notification so one physical event doesn't fragment into
+# several short, out-of-order clips.
+EVENT_MERGE_GAP = get_int_setting("EVENT_MERGE_GAP", 45)  # seconds of quiet before finalizing a group
+MAX_EVENT_SPAN = get_int_setting("MAX_EVENT_SPAN", 300)  # hard cap on merged-group duration
 
 # Shared Telegram API timeout kwargs for consistent usage across all media/message sends
 TELEGRAM_TIMEOUT_KWARGS = {
@@ -113,7 +118,6 @@ TELEGRAM_TIMEOUT_KWARGS = {
 
 # Media types configuration: { key: (filename, content_type) }
 EVENT_MEDIA_CONFIG = {
-    "gif": ("preview.gif", "image/gif"),
     "clip": ("clip.mp4", "video/mp4"),
     "thumbnail": ("thumbnail.jpg", "image/jpeg"),
 }
@@ -241,45 +245,26 @@ async def check_frigate_status(client: httpx.AsyncClient) -> bool:
         return False
 
 
-async def fetch_events(client: httpx.AsyncClient, after_ts: float) -> list[dict]:
-    """Fetch events from Frigate API for all monitored cameras since *after_ts*.
+async def fetch_review_items(client: httpx.AsyncClient, after_ts: float) -> list[dict]:
+    """Fetch review items from Frigate API since *after_ts*.
 
-    If MONITOR_CONFIG is empty, fetches all cameras without filtering.
-    Deduplicates events by ID across cameras.
+    Review items cluster rapid-fire object-detection events on the same
+    camera into one continuous activity segment server-side, which is what
+    the polling loop groups notifications around. Unlike /api/events, a
+    single call already covers all cameras.
     """
-    async def fetch_camera_events(camera: str | None) -> list[dict]:
-        params: dict[str, str | float] = {"after": after_ts}
-        if camera:
-            params["camera"] = camera
-        try:
-            resp = await client.get(
-                f"{FRIGATE_URL}/api/events",
-                params=params,
-                auth=_http_auth(),
-                timeout=FRIGATE_TIMEOUT,
-            )
-            resp.raise_for_status()
-            events = resp.json()
-            logger.debug("Fetched %d events for camera=%s", len(events), camera or "all")
-            return events
-        except Exception as exc:
-            logger.warning("Error fetching events for camera=%s: %s", camera or "all", exc)
-            return []
-
-    cameras = list(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else [None]
-    results = await asyncio.gather(*[fetch_camera_events(c) for c in cameras])
-
-    seen_ids: set[str] = set()
-    all_events: list[dict] = []
-
-    for events in results:
-        for ev in events:
-            eid = ev.get("id")
-            if eid and eid not in seen_ids:
-                seen_ids.add(eid)
-                all_events.append(ev)
-
-    return all_events
+    try:
+        resp = await client.get(
+            f"{FRIGATE_URL}/api/review",
+            params={"after": after_ts},
+            auth=_http_auth(),
+            timeout=FRIGATE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logger.warning("Error fetching review items: %s", exc)
+        return []
 
 
 async def fetch_media_with_retry(
@@ -556,15 +541,15 @@ async def trigger_manual_event(
 # ─────────────────────── Event Filtering ─────────────────────────────
 
 
-def event_matches_config(event: dict) -> bool:
-    """Check whether an event matches the MONITOR_CONFIG zones filter.
+def matches_monitor_config(camera: str, zones: list[str]) -> bool:
+    """Check whether a camera/zones pair matches the MONITOR_CONFIG filter.
 
-    If MONITOR_CONFIG is empty, all events pass.
+    If MONITOR_CONFIG is empty, everything passes. Shared by both raw Frigate
+    events and review items, since both shapes reduce to (camera, zones).
     """
     if not MONITOR_CONFIG:
         return True
 
-    camera = event.get("camera", "")
     if camera not in MONITOR_CONFIG:
         return False
 
@@ -572,9 +557,8 @@ def event_matches_config(event: dict) -> bool:
     if "all" in allowed_zones:
         return True
 
-    event_zones = event.get("zones", [])
-    # Match if any event zone is in the allowed list
-    return not allowed_zones.isdisjoint(event_zones)
+    # Match if any zone is in the allowed list
+    return not allowed_zones.isdisjoint(zones)
 
 
 # ─────────────────────── Caption Formatting ──────────────────────────
@@ -599,6 +583,32 @@ def _epoch_to_datetime(epoch: float | None) -> str:
         return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _parse_sub_label(event: dict) -> tuple[str | None, float | None]:
+    """Parse Frigate's sub_label field into (name, score).
+
+    Frigate returns sub_label as either ["name", score], a plain string, or a
+    dict, from either the top-level or nested 'data' field.
+    """
+    raw_sub_label = event.get("sub_label")
+    if not raw_sub_label and "data" in event:
+        raw_sub_label = event.get("data", {}).get("sub_label")
+
+    if isinstance(raw_sub_label, list) and len(raw_sub_label) >= 1:
+        name = str(raw_sub_label[0])
+        score = None
+        if len(raw_sub_label) >= 2:
+            try:
+                score = float(raw_sub_label[1])
+            except (ValueError, TypeError):
+                pass
+        return name, score
+    if isinstance(raw_sub_label, dict):
+        return raw_sub_label.get("label") or raw_sub_label.get("name"), raw_sub_label.get("score")
+    if isinstance(raw_sub_label, str) and raw_sub_label:
+        return raw_sub_label, None
+    return None, None
+
+
 def format_caption(event: dict) -> str:
     """Build an HTML caption for the Telegram animation message.
 
@@ -608,10 +618,7 @@ def format_caption(event: dict) -> str:
     event_id = event.get("id", "unknown")
     camera = event.get("camera", "unknown")
     label = event.get("label", "object")
-    raw_sub_label = event.get("sub_label")
-    # Fallback to data field if top-level sub_label is missing
-    if not raw_sub_label and "data" in event:
-        raw_sub_label = event.get("data", {}).get("sub_label")
+    sub_label_name, sub_label_score = _parse_sub_label(event)
 
     zones = ", ".join(event.get("zones", [])) or "N/A"
     score = event.get("top_score")
@@ -619,24 +626,8 @@ def format_caption(event: dict) -> str:
     start_time = _epoch_to_datetime(event.get("start_time"))
     end_time = _epoch_to_datetime(event.get("end_time"))
 
-    # Parse sub_label — Frigate returns either ["name", score], plain string, or dictionary
-    sub_label_name = None
-    sub_label_score = None
-    if isinstance(raw_sub_label, list) and len(raw_sub_label) >= 1:
-        sub_label_name = str(raw_sub_label[0])
-        if len(raw_sub_label) >= 2:
-            try:
-                sub_label_score = float(raw_sub_label[1])
-            except (ValueError, TypeError):
-                pass
-    elif isinstance(raw_sub_label, dict):
-        sub_label_name = raw_sub_label.get("label") or raw_sub_label.get("name")
-        sub_label_score = raw_sub_label.get("score")
-    elif isinstance(raw_sub_label, str) and raw_sub_label:
-        sub_label_name = raw_sub_label
-
-    if DEBUG and raw_sub_label:
-        logger.debug("Event %s raw sub_label: %s", event_id, raw_sub_label)
+    if DEBUG and sub_label_name:
+        logger.debug("Event %s parsed sub_label: %s (score=%s)", event_id, sub_label_name, sub_label_score)
 
     lines = [
         f"🚨 <b>Detection Alert</b>",
@@ -670,62 +661,118 @@ def format_caption(event: dict) -> str:
 
 
 
+def format_grouped_caption(data: dict) -> str:
+    """Build an HTML caption for a (possibly merged) notification group.
+
+    Unlike format_caption (single raw Frigate event, still used by manual
+    commands), this accepts the aggregated payload built by
+    send_grouped_notification: unioned labels/zones/recognized names across
+    every constituent event, spanning the group's earliest start to latest
+    end.
+    """
+    camera = data.get("camera", "unknown")
+    labels = sorted(data.get("labels") or ["object"])
+    zones = sorted(data.get("zones") or [])
+    score = data.get("top_score")
+    score_str = f"{score:.0%}" if score else "N/A"
+    start_time = _epoch_to_datetime(data.get("start_time"))
+    end_time = _epoch_to_datetime(data.get("end_time"))
+
+    lines = [
+        f"🚨 <b>Detection Alert</b>",
+        f"",
+        f"📷 <b>Camera:</b> {html.escape(camera)}",
+        f"🏷️ <b>Label:</b> {html.escape(', '.join(labels))} ({score_str})",
+        f"📍 <b>Zone(s):</b> {html.escape(', '.join(zones)) if zones else 'N/A'}",
+    ]
+
+    for name, sub_score in data.get("sub_labels") or []:
+        if sub_score is not None:
+            lines.append(f"👤 <b>Recognized:</b> {html.escape(name)} ({sub_score:.0%})")
+        else:
+            lines.append(f"👤 <b>Recognized:</b> {html.escape(name)}")
+
+    lines.append(f"📅 <b>Time:</b> {start_time}")
+
+    # Only show end time if the group has actually finished
+    if data.get("end_time"):
+        lines.append(f"🕑 <b>End:</b> {end_time}")
+
+    lines.append("")
+
+    # External event link (Cloudflare Tunnel URL) — points at the first
+    # constituent event, since a merged group has no single event page.
+    if EXTERNAL_URL:
+        event_id = data.get("primary_event_id", "")
+        event_url = f"{EXTERNAL_URL}/events/{event_id}"
+        lines.append(f'🔗 <a href="{html.escape(event_url, quote=True)}">View Event in Frigate</a>')
+
+    return "\n".join(lines)
+
+
 # ─────────────────────── Telegram Notification ───────────────────────
 
 
-async def send_event_notification(bot: Bot, event: dict, http_client: httpx.AsyncClient) -> None:
-    """Send a **single** consolidated Telegram message for a Frigate event.
+async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: httpx.AsyncClient) -> None:
+    """Send a **single** consolidated Telegram message for a notification group.
 
-    Flow:
-    1. Wait MEDIA_WAIT_TIMEOUT seconds so Frigate can generate the preview.
-    2. Refetch event details to get the latest metadata (like sub_label).
-    3. Fetch clip/GIF, thumbnail, and camera snapshot in parallel.
-    4. Send ONE message:
-       - SEND_CLIP + clip → send_video (HD clip.mp4)
-       - GIF available    → send_animation (preview.gif)
-       - No GIF, photo    → send_photo (snapshot/thumbnail)
-       - No media at all  → send_message (text-only fallback)
-
-    Media is wrapped with an explicit filename so Telegram recognises the
-    Content-Type correctly (fixes the octet-stream / broken-file issue).
+    A group may span one or several Frigate event IDs that were fragments of
+    the same physical activity (see grouping.py). Flow:
+    1. Fetch each constituent event's own details (real start/end/label/
+       zones/sub_label — the review item's own bounds aren't always tight).
+    2. Aggregate: union labels/zones/recognized-names, earliest start →
+       latest end across all constituent events.
+    3. Always build the clip via fetch_recording_clip over that union
+       window — a real continuous recording, not a per-event preview that
+       may only cover part of the activity.
+    4. Send ONE message: video → photo (snapshot/thumbnail fallback) →
+       text-only, same fallback shape as before.
     """
-    event_id = event.get("id", "unknown")
-    camera = event.get("camera", "unknown")
+    details_list = await asyncio.gather(
+        *[fetch_event_details(http_client, event_id) for event_id in group.event_ids]
+    )
+    details_list = [d for d in details_list if d]
 
-    # ── Wait for Frigate to generate previews ────────────────────────
-    if MEDIA_WAIT_TIMEOUT > 0:
-        logger.debug(
-            "Event %s: waiting %ds for Frigate to generate media…",
-            event_id, MEDIA_WAIT_TIMEOUT,
-        )
-        await asyncio.sleep(MEDIA_WAIT_TIMEOUT)
+    now = time.time()
+    starts = [d["start_time"] for d in details_list if d.get("start_time")]
+    ends = [d.get("end_time") or now for d in details_list]
+    union_start = min(starts) if starts else group.first_start
+    union_end = max(ends) if ends else group.last_activity_end
 
-    # ── Refetch event details to get updated sub_label ────────────────
-    updated_event = await fetch_event_details(http_client, event_id)
-    if updated_event:
-        event = updated_event
+    labels = {d["label"] for d in details_list if d.get("label")} or set(group.labels)
+    zones: set[str] = set()
+    for d in details_list:
+        zones.update(d.get("zones", []))
 
-    caption = format_caption(event)
+    sub_labels: dict[str, float | None] = {}
+    for d in details_list:
+        name, score = _parse_sub_label(d)
+        if name and (name not in sub_labels or (score or 0) > (sub_labels[name] or 0)):
+            sub_labels[name] = score
 
-    # ── Fetch media sequentially based on priority ────────────────────
-    clip_data = None
-    gif_data = None
-    photo_data = None
+    scores = [d["top_score"] for d in details_list if d.get("top_score")]
+    top_score = max(scores) if scores else None
+    primary_event_id = details_list[0]["id"] if details_list else next(iter(group.event_ids), "unknown")
 
-    if SEND_CLIP:
-        clip_data = await fetch_event_media(http_client, event_id, "clip")
+    caption = format_grouped_caption({
+        "camera": group.camera,
+        "labels": labels,
+        "zones": zones,
+        "sub_labels": list(sub_labels.items()),
+        "top_score": top_score,
+        "start_time": union_start,
+        "end_time": union_end,
+        "primary_event_id": primary_event_id,
+    })
 
-    if not clip_data:
-        gif_data = await fetch_event_media(http_client, event_id, "gif")
+    clip_data = await fetch_recording_clip(http_client, group.camera, int(union_start), int(union_end))
 
-    # Fetch thumbnail to use as preview for video/gif, or as fallback photo
-    photo_data = await fetch_camera_snapshot(http_client, camera)
+    photo_data = await fetch_camera_snapshot(http_client, group.camera)
     if not photo_data:
-        photo_data = await fetch_event_media(http_client, event_id, "thumbnail")
+        photo_data = await fetch_event_media(http_client, primary_event_id, "thumbnail")
 
     try:
-        if SEND_CLIP and clip_data:
-            # ── HD: send clip.mp4 as video (auto-plays in Telegram) ───
+        if clip_data:
             await bot.send_video(
                 chat_id=TELEGRAM_CHAT_ID,
                 video=clip_data,
@@ -736,23 +783,12 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 supports_streaming=True,
                 **TELEGRAM_TIMEOUT_KWARGS,
             )
-            logger.info("Event %s → sent HD video clip with caption ✓", event_id)
-
-        elif gif_data:
-            # ── Standard: send preview.gif as animation ───────────────
-            await bot.send_animation(
-                chat_id=TELEGRAM_CHAT_ID,
-                animation=gif_data,
-                thumbnail=photo_data,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                filename="preview.gif",
-                **TELEGRAM_TIMEOUT_KWARGS,
+            logger.info(
+                "Group on %s (%d event(s)) → sent HD video clip with caption ✓",
+                group.camera, len(group.event_ids),
             )
-            logger.info("Event %s → sent animation with caption ✓", event_id)
 
         elif photo_data:
-            # ── Fallback 1: send photo with caption ──────────────────
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=photo_data,
@@ -761,20 +797,19 @@ async def send_event_notification(bot: Bot, event: dict, http_client: httpx.Asyn
                 filename="snapshot.jpg",
                 **TELEGRAM_TIMEOUT_KWARGS,
             )
-            logger.info("Event %s → sent photo with caption (GIF unavailable)", event_id)
+            logger.info("Group on %s → sent photo with caption (clip unavailable)", group.camera)
 
         else:
-            # ── Fallback 2: text-only ────────────────────────────────
             await bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=caption,
                 parse_mode=ParseMode.HTML,
                 **TELEGRAM_TIMEOUT_KWARGS,
             )
-            logger.info("Event %s → sent text only (no media available)", event_id)
+            logger.info("Group on %s → sent text only (no media available)", group.camera)
 
     except Exception as exc:
-        logger.error("Failed to send Telegram notification for event %s: %s", event_id, exc)
+        logger.error("Failed to send Telegram notification for group on %s: %s", group.camera, exc)
 
 
 # ─────────────────── Telegram Command Handlers ───────────────────────
@@ -1254,14 +1289,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─────────────────────── Main Polling Loop ───────────────────────────
 
 
+async def _polling_tick(
+    bot: Bot,
+    http_client: httpx.AsyncClient,
+    pending: dict[str, PendingGroup],
+    last_poll_ts: float,
+    now: float | None = None,
+) -> float:
+    """Run one polling iteration: fetch new review items, merge them into
+    pending groups, finalize+send any that have gone quiet, and return the
+    new last_poll_ts. Extracted from polling_loop so the hold→merge→send
+    flow can be unit tested across multiple ticks without an infinite loop.
+    """
+    if now is None:
+        now = time.time()
+
+    reviews = await fetch_review_items(http_client, last_poll_ts)
+    new_last_poll_ts = time.time()
+
+    matched = [
+        r for r in reviews
+        if matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
+    ]
+    for review in matched:
+        merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
+
+    ready = split_ready_groups(pending, now, EVENT_MERGE_GAP, MAX_EVENT_SPAN)
+    ready.sort(key=lambda g: g.first_start)
+
+    if matched or ready:
+        logger.info(
+            "Processing %d new review item(s), %d group(s) ready to send",
+            len(matched), len(ready),
+        )
+
+    # Sequential, not gather: keeps the chat feed in chronological order.
+    for group in ready:
+        try:
+            await send_grouped_notification(bot, group, http_client)
+        except Exception as e:
+            logger.error("Fatal error processing notification group: %s", e)
+
+    return new_last_poll_ts
+
+
 async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
     """Continuously poll Frigate for new events and send notifications.
-    
+
     Implements a back-off strategy if Frigate is unreachable.
     """
     last_poll_ts = time.time()
     current_interval = POLLING_INTERVAL
     frigate_online = True
+    pending: dict[str, PendingGroup] = {}
 
     logger.info(
         "Polling started — interval=%ds, cameras=%s",
@@ -1272,43 +1352,24 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
     while True:
         try:
             if state.enabled:
-                poll_after = last_poll_ts
-                
                 try:
-                    events = await fetch_events(http_client, poll_after)
-                    
+                    last_poll_ts = await _polling_tick(bot, http_client, pending, last_poll_ts)
+
                     # Recovery logic
                     if not frigate_online:
                         logger.info("Frigate is back online! Resuming normal polling.")
                         frigate_online = True
                         current_interval = POLLING_INTERVAL
 
-                    last_poll_ts = time.time()
-                    matched = [ev for ev in events if event_matches_config(ev)]
-
-                    if matched:
-                        logger.info("Processing %d new event(s)", len(matched))
-
-                        async def send_safe(ev):
-                            try:
-                                await send_event_notification(bot, ev, http_client)
-                            except Exception as e:
-                                logger.error("Fatal error processing event notification: %s", e)
-
-                        await asyncio.gather(*[send_safe(ev) for ev in matched])
-                        logger.info("All events processed.")
-                    else:
-                        logger.debug("No new matching events.")
-                
                 except (httpx.NetworkError, httpx.TimeoutException) as exc:
                     if frigate_online:
                         logger.error("Frigate connection lost: %s. Entering back-off mode.", exc)
                         frigate_online = False
-                    
+
                     # Simple linear back-off: increase interval but stay responsive
-                    current_interval = min(current_interval + 60, 300) 
+                    current_interval = min(current_interval + 60, 300)
                     logger.debug("Frigate unreachable, retrying in %ds", current_interval)
-                
+
                 except Exception as exc:
                     logger.error("Unexpected error in polling loop: %s", exc, exc_info=DEBUG)
             else:
@@ -1345,9 +1406,9 @@ async def main() -> None:
     logger.info("Polling interval: %ds", POLLING_INTERVAL)
     logger.info("Frigate timeout: %ds", FRIGATE_TIMEOUT)
     logger.info("Telegram connect timeout: %ds", TELEGRAM_CONNECT_TIMEOUT)
-    logger.info("Media wait timeout: %ds", MEDIA_WAIT_TIMEOUT)
     logger.info("Upload timeout: %ds", UPLOAD_TIMEOUT)
-    logger.info("Send HD clip: %s", SEND_CLIP)
+    logger.info("Event merge gap: %ds", EVENT_MERGE_GAP)
+    logger.info("Max event span: %ds", MAX_EVENT_SPAN)
     logger.info("Timezone: %s", TIMEZONE)
     logger.info("Debug: %s", DEBUG)
 
