@@ -106,6 +106,7 @@ UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)  # seconds for Telegram m
 # several short, out-of-order clips.
 EVENT_MERGE_GAP = get_int_setting("EVENT_MERGE_GAP", 45)  # seconds of quiet before finalizing a group
 MAX_EVENT_SPAN = get_int_setting("MAX_EVENT_SPAN", 300)  # hard cap on merged-group duration
+CLIP_PADDING_SECONDS = get_int_setting("CLIP_PADDING_SECONDS", 5)  # extra seconds shown before/after the detected activity
 
 # Shared Telegram API timeout kwargs for consistent usage across all media/message sends
 TELEGRAM_TIMEOUT_KWARGS = {
@@ -765,7 +766,9 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         "primary_event_id": primary_event_id,
     })
 
-    clip_data = await fetch_recording_clip(http_client, group.camera, int(union_start), int(union_end))
+    padded_start = max(0, int(union_start) - CLIP_PADDING_SECONDS)
+    padded_end = int(union_end) + CLIP_PADDING_SECONDS
+    clip_data = await fetch_recording_clip(http_client, group.camera, padded_start, padded_end)
 
     photo_data = await fetch_camera_snapshot(http_client, group.camera)
     if not photo_data:

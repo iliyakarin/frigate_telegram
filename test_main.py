@@ -193,13 +193,37 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         await main.send_grouped_notification(bot, group, http_client)
 
-        # Clip fetched over the union of constituent event bounds, not the review's own
-        mock_clip.assert_called_once_with(http_client, "Garage", 100, 200)
+        # Clip fetched over the union of constituent event bounds padded by
+        # CLIP_PADDING_SECONDS on each side, not the exact/review's own bounds.
+        mock_clip.assert_called_once_with(
+            http_client, "Garage", 100 - main.CLIP_PADDING_SECONDS, 200 + main.CLIP_PADDING_SECONDS
+        )
         bot.send_video.assert_called_once()
         call_kwargs = bot.send_video.call_args.kwargs
         self.assertEqual(call_kwargs["video"], b"clip_bytes")
         self.assertIn("Found", call_kwargs["caption"])
         self.assertIn("driveway, porch", call_kwargs["caption"])
+
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_clamps_padding_at_zero(self, mock_details, mock_clip, mock_snap):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=2, last_activity_end=10, last_seen_at=10,
+        )
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 2, "end_time": 10}
+        mock_clip.return_value = b"clip_bytes"
+        mock_snap.return_value = b"snap_bytes"
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        # start_time=2 minus padding would go negative; must clamp to 0.
+        mock_clip.assert_called_once_with(http_client, "Garage", 0, 10 + main.CLIP_PADDING_SECONDS)
 
     @patch("main.fetch_camera_snapshot")
     @patch("main.fetch_recording_clip")

@@ -57,6 +57,7 @@ docker compose logs -f
 | `POLLING_INTERVAL` | ❌ | `60` | Seconds between polls |
 | `EVENT_MERGE_GAP` | ❌ | `45` | Seconds of quiet before finalizing a notification — related activity on the same camera within this gap gets merged into one message |
 | `MAX_EVENT_SPAN` | ❌ | `300` | Hard cap (seconds) on a merged notification's duration, so continuously recurring activity still gets sent eventually |
+| `CLIP_PADDING_SECONDS` | ❌ | `5` | Extra seconds included before the activity starts and after it ends in the sent clip |
 | `UPLOAD_TIMEOUT` | ❌ | `60` | Seconds for Telegram upload timeout (increase for slow tunnels) |
 | `TIMEZONE` | ❌ | `UTC` | Timezone for timestamps (e.g. `America/Chicago`) |
 | `LOCALES` | ❌ | `en-US` | Locale for date formatting |
