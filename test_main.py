@@ -225,6 +225,125 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         # start_time=2 minus padding would go negative; must clamp to 0.
         mock_clip.assert_called_once_with(http_client, "Garage", 0, 10 + main.CLIP_PADDING_SECONDS)
 
+    @patch('main.fetch_camera_snapshot')
+    @patch('main.fetch_recording_clip')
+    @patch('main.fetch_event_details')
+    async def test_send_grouped_notification_splits_into_two_clips_when_over_limit(
+        self, mock_details, mock_clip, mock_snap
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera='Backyard', labels={'person'}, review_ids=['rev1'], event_ids={'e1'},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+        mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 200}
+
+        def clip_side_effect(_client, camera, start, end):
+            if start == 100 - main.CLIP_PADDING_SECONDS and end == 200 + main.CLIP_PADDING_SECONDS:
+                return b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+            elif end <= (100 - main.CLIP_PADDING_SECONDS + 200 + main.CLIP_PADDING_SECONDS) // 2:
+                return b'part1_bytes'
+            else:
+                return b'part2_bytes'
+
+        mock_clip.side_effect = clip_side_effect
+        mock_snap.return_value = b'snap_bytes'
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_video.call_count, 2)
+        call1 = bot.send_video.call_args_list[0]
+        call2 = bot.send_video.call_args_list[1]
+        self.assertEqual(call1.kwargs['video'], b'part1_bytes')
+        self.assertIn('1/2', call1.kwargs['caption'])
+        self.assertEqual(call2.kwargs['video'], b'part2_bytes')
+        self.assertIn('2/2', call2.kwargs['caption'])
+
+    @patch('main.fetch_camera_snapshot')
+    @patch('main.fetch_recording_clip')
+    @patch('main.fetch_event_details')
+    async def test_send_grouped_notification_handles_partial_split_success(
+        self, mock_details, mock_clip, mock_snap
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera='Backyard', labels={'person'}, review_ids=['rev1'], event_ids={'e1'},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+        mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 200}
+
+        def clip_side_effect(_client, camera, start, end):
+            if start == 100 - main.CLIP_PADDING_SECONDS and end == 200 + main.CLIP_PADDING_SECONDS:
+                return b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+            elif end <= (100 - main.CLIP_PADDING_SECONDS + 200 + main.CLIP_PADDING_SECONDS) // 2:
+                return b'part1_bytes'
+            else:
+                return b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024) # part2 too large
+
+        mock_clip.side_effect = clip_side_effect
+        mock_snap.return_value = b'snap_bytes'
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_video.call_count, 1)
+        self.assertEqual(bot.send_video.call_args.kwargs['video'], b'part1_bytes')
+
+    @patch('main.fetch_camera_snapshot')
+    @patch('main.fetch_recording_clip')
+    @patch('main.fetch_event_details')
+    async def test_send_grouped_notification_falls_back_to_photo_if_split_parts_still_too_large(
+        self, mock_details, mock_clip, mock_snap
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera='Backyard', labels={'person'}, review_ids=['rev1'], event_ids={'e1'},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+        mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 200}
+        mock_clip.return_value = b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+        mock_snap.return_value = b'snap_bytes'
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        bot.send_video.assert_not_called()
+        bot.send_photo.assert_called_once()
+        self.assertEqual(bot.send_photo.call_args.kwargs['photo'], b'snap_bytes')
+
+    @patch('main.fetch_camera_snapshot')
+    @patch('main.fetch_recording_clip')
+    @patch('main.fetch_event_details')
+    async def test_send_grouped_notification_falls_back_to_photo_on_send_video_exception(
+        self, mock_details, mock_clip, mock_snap
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock(side_effect=Exception('Request Entity Too Large (413)'))
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera='Backyard', labels={'person'}, review_ids=['rev1'], event_ids={'e1'},
+            first_start=100, last_activity_end=110, last_seen_at=110,
+        )
+        mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 110}
+        mock_clip.return_value = b'clip_bytes'
+        mock_snap.return_value = b'snap_bytes'
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        bot.send_photo.assert_called_once()
+        self.assertEqual(bot.send_photo.call_args.kwargs['photo'], b'snap_bytes')
+
     @patch("main.fetch_camera_snapshot")
     @patch("main.fetch_recording_clip")
     @patch("main.fetch_event_details")

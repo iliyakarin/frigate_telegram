@@ -107,6 +107,7 @@ UPLOAD_TIMEOUT = get_int_setting("UPLOAD_TIMEOUT", 60)  # seconds for Telegram m
 EVENT_MERGE_GAP = get_int_setting("EVENT_MERGE_GAP", 45)  # seconds of quiet before finalizing a group
 MAX_EVENT_SPAN = get_int_setting("MAX_EVENT_SPAN", 300)  # hard cap on merged-group duration
 CLIP_PADDING_SECONDS = get_int_setting("CLIP_PADDING_SECONDS", 5)  # extra seconds shown before/after the detected activity
+MAX_TELEGRAM_FILE_SIZE = get_int_setting("MAX_TELEGRAM_FILE_SIZE", 50 * 1024 * 1024)  # Telegram bot upload limit (50 MB)
 
 # Shared Telegram API timeout kwargs for consistent usage across all media/message sends
 TELEGRAM_TIMEOUT_KWARGS = {
@@ -774,21 +775,43 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
     if not photo_data:
         photo_data = await fetch_event_media(http_client, primary_event_id, "thumbnail")
 
+    # If the combined clip exceeds Telegram's limit (50MB), split into two parts
+    clips_to_send: list[tuple[bytes, str]] = []
+    if clip_data:
+        if len(clip_data) <= MAX_TELEGRAM_FILE_SIZE:
+            clips_to_send.append((clip_data, caption))
+        else:
+            mid = padded_start + (padded_end - padded_start) // 2
+            if mid > padded_start and padded_end > mid:
+                logger.info(
+                    "Clip for %s (%d bytes) exceeds %d MB limit; splitting into 2 parts",
+                    group.camera, len(clip_data), MAX_TELEGRAM_FILE_SIZE // (1024 * 1024),
+                )
+                clip1_task = fetch_recording_clip(http_client, group.camera, padded_start, mid)
+                clip2_task = fetch_recording_clip(http_client, group.camera, mid, padded_end)
+                clip1, clip2 = await asyncio.gather(clip1_task, clip2_task)
+
+                if clip1 and len(clip1) <= MAX_TELEGRAM_FILE_SIZE:
+                    clips_to_send.append((clip1, f"{caption}\n\n📹 <i>(Part 1/2)</i>"))
+                if clip2 and len(clip2) <= MAX_TELEGRAM_FILE_SIZE:
+                    clips_to_send.append((clip2, f"{caption}\n\n📹 <i>(Part 2/2)</i>"))
+
     try:
-        if clip_data:
-            await bot.send_video(
-                chat_id=TELEGRAM_CHAT_ID,
-                video=clip_data,
-                thumbnail=photo_data,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                filename="clip.mp4",
-                supports_streaming=True,
-                **TELEGRAM_TIMEOUT_KWARGS,
-            )
+        if clips_to_send:
+            for i, (video_bytes, cap) in enumerate(clips_to_send):
+                await bot.send_video(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    video=video_bytes,
+                    thumbnail=photo_data if i == 0 else None,
+                    caption=cap,
+                    parse_mode=ParseMode.HTML,
+                    filename=f"clip_part{i+1}.mp4" if len(clips_to_send) > 1 else "clip.mp4",
+                    supports_streaming=True,
+                    **TELEGRAM_TIMEOUT_KWARGS,
+                )
             logger.info(
-                "Group on %s (%d event(s)) → sent HD video clip with caption ✓",
-                group.camera, len(group.event_ids),
+                "Group on %s (%d event(s)) → sent %d video clip(s) with caption ✓",
+                group.camera, len(group.event_ids), len(clips_to_send),
             )
 
         elif photo_data:
@@ -800,7 +823,7 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
                 filename="snapshot.jpg",
                 **TELEGRAM_TIMEOUT_KWARGS,
             )
-            logger.info("Group on %s → sent photo with caption (clip unavailable)", group.camera)
+            logger.info("Group on %s → sent photo with caption (clip unavailable or exceeds size limit)", group.camera)
 
         else:
             await bot.send_message(
@@ -812,7 +835,27 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
             logger.info("Group on %s → sent text only (no media available)", group.camera)
 
     except Exception as exc:
-        logger.error("Failed to send Telegram notification for group on %s: %s", group.camera, exc)
+        logger.error("Failed to send Telegram video notification for group on %s: %s", group.camera, exc)
+        try:
+            if photo_data:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=photo_data,
+                    caption=f"{caption}\n\n⚠️ <i>(Video upload failed, sent snapshot)</i>",
+                    parse_mode=ParseMode.HTML,
+                    filename="snapshot.jpg",
+                    **TELEGRAM_TIMEOUT_KWARGS,
+                )
+                logger.info("Group on %s → fallback photo sent successfully ✓", group.camera)
+            else:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"{caption}\n\n⚠️ <i>(Video upload failed)</i>",
+                    parse_mode=ParseMode.HTML,
+                    **TELEGRAM_TIMEOUT_KWARGS,
+                )
+        except Exception as fallback_exc:
+            logger.error("Fallback notification also failed for group on %s: %s", group.camera, fallback_exc)
 
 
 # ─────────────────── Telegram Command Handlers ───────────────────────
