@@ -7,6 +7,7 @@ A Python bot that polls [Frigate NVR](https://frigate.video/) for detection even
 ## ✨ Features
 
 - **Single-message delivery** — full HD video clip + event details in one Telegram message (no spam)
+- **Camera health alerts** — automated detection of disconnected cameras or 0 FPS streams with 60s debounce, repeat escalation schedule (+5m, +60m, +12h, +24h), recovery notifications with downtime tracking, and error log extraction
 - **Event grouping** — merges rapid-fire Frigate events on the same camera into one notification spanning the whole activity, sent in chronological order, instead of several short out-of-order clips (`EVENT_MERGE_GAP`, `MAX_EVENT_SPAN`)
 - **Face recognition** — displays recognized names from Frigate's `sub_label` field
 - **Multi-camera matrix** — monitor specific cameras and zones via `MONITOR_CONFIG`
@@ -51,6 +52,7 @@ docker compose logs -f
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | ✅ | — | Target chat/group ID for notifications |
 | `MONITOR_CONFIG` | ❌ | *(all)* | Camera/zone matrix — see [below](#-monitor-config) |
+| `HEALTH_MONITOR_CAMERAS` | ❌ | *(all)* | Comma-separated or JSON list of cameras to monitor for health alerts (defaults to all) |
 | `EXTERNAL_URL` | ❌ | — | Public Frigate URL for clickable event links (e.g. via Cloudflare Tunnel) |
 | `FRIGATE_USERNAME` | ❌ | — | Basic auth username (if Frigate auth is enabled) |
 | `FRIGATE_PASSWORD` | ❌ | — | Basic auth password |
@@ -158,14 +160,29 @@ Frigate stores recognized faces in the `sub_label` field of event data. When pre
 
 No additional configuration is needed — the bot reads `sub_label` directly from the Frigate event API.
 
+## 🩺 Camera Health Alerts
+
+The bot continuously monitors camera connection quality and frame rates via Frigate's `/api/stats` endpoint.
+
+- **Debounced Detection:** Cameras must be continuously disconnected or at 0 FPS for at least **60 seconds** before an alert triggers, preventing false alarms from brief network hiccups.
+- **Escalation Schedule:** Alerts are repeated up to 5 times on an escalating schedule:
+  - Initial Alert: After 60s continuous failure
+  - Alert 2: +5 minutes
+  - Alert 3: +60 minutes
+  - Alert 4: +12 hours
+  - Alert 5: +24 hours (silenced after Alert 5 until recovery)
+- **Dual-Check Error Details:** When an alert is triggered, the bot inspects Frigate's `/api/logs/frigate` to extract relevant ffmpeg/demuxing errors. If log access is unavailable, it falls back cleanly to stats data.
+- **Recovery Notification:** When a camera reconnects and begins receiving frames again, the bot sends a recovery alert with the total downtime duration and resets all counters.
+- **Configurable Scope:** By default, all cameras reported by Frigate are monitored. Use `HEALTH_MONITOR_CAMERAS` to limit monitoring to specific cameras.
+
 ## 🤖 Telegram Commands
 
 | Command | Description |
 |---|---|
 | `/enable_notifications` | Turn on event notifications |
 | `/disable_notifications` | Turn off event notifications |
-| `/status` | Show current bot status, polling interval, and monitored cameras |
-| `/cameras` | List all camera names registered on Frigate |
+| `/status` | Show bot status, polling interval, and real-time camera health |
+| `/cameras` | List registered cameras with real-time health indicators (🟢 / 🔴) |
 | `/menu` | Open the main interaction menu dashboard |
 | `/photo [camera]` | Get a snapshot |
 | `/photo_all` | Get current snapshots from all cameras |

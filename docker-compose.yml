@@ -37,6 +37,10 @@ services:
       # Omit entirely to monitor ALL cameras and zones
       - MONITOR_CONFIG={"front_door": ["yard", "driveway"], "back_camera": ["all"]}
 
+      # Camera Health Alerts (offline/disconnected notifications)
+      # Comma-separated or JSON list of cameras to monitor. Omit to monitor all cameras.
+      # - HEALTH_MONITOR_CAMERAS=front_door,back_camera
+
 
       # ── Optional ──────────────────────────────────────────────
       - EXTERNAL_URL=https://cctv.example.com            # Public Frigate URL via Cloudflare Tunnel (for event links)
