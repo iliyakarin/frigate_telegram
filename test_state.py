@@ -2,11 +2,17 @@ import sys
 from unittest.mock import MagicMock
 
 # Mock dependencies that might be missing for standard unit test run
-sys.modules["httpx"] = MagicMock()
-sys.modules["telegram"] = MagicMock()
-sys.modules["telegram.constants"] = MagicMock()
-sys.modules["telegram.ext"] = MagicMock()
-sys.modules["dotenv"] = MagicMock()
+try:
+    import httpx
+except ImportError:
+    sys.modules["httpx"] = MagicMock()
+
+for mod in ["telegram", "telegram.constants", "telegram.ext", "dotenv"]:
+    if mod not in sys.modules:
+        try:
+            __import__(mod)
+        except ImportError:
+            sys.modules[mod] = MagicMock()
 
 import unittest
 import json

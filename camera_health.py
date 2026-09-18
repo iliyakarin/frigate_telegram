@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # Repeat escalation delays in seconds after the preceding alert:
@@ -292,3 +294,91 @@ class CameraHealthMonitor:
             f"<b>Downtime:</b> {downtime_str}\n"
             f"<b>Time:</b> {timestamp_str}"
         )
+
+    def evaluate_stats(
+        self,
+        stats_data: dict[str, Any],
+        now: float | None = None,
+    ) -> list[HealthAlert]:
+        """Evaluate /api/stats payload and return any alerts due."""
+        if now is None:
+            now = time.time()
+
+        uptime = stats_data.get("service", {}).get("uptime", 0)
+        # Skip checks during Frigate startup grace period (< 60s)
+        if uptime < 60:
+            return []
+
+        cameras_stats = stats_data.get("cameras", {})
+        alerts: list[HealthAlert] = []
+
+        for camera, data in cameras_stats.items():
+            if not self.should_monitor(camera):
+                continue
+
+            current_fps = float(data.get("camera_fps", 0.0))
+            expected_fps = float(data.get("expected_fps", 5.0))
+            connection_quality = str(data.get("connection_quality", "")).lower()
+
+            # Flagged as failing if fps < 0.1 or connection unusable
+            is_failing = (current_fps < 0.1) or (connection_quality == "unusable")
+
+            alert = self.update_camera(
+                camera=camera,
+                is_failing=is_failing,
+                current_fps=current_fps,
+                expected_fps=expected_fps,
+                now=now,
+            )
+            if alert is not None:
+                alerts.append(alert)
+
+        return alerts
+
+
+async def fetch_log_error_detail(
+    client: httpx.AsyncClient,
+    frigate_url: str,
+    camera: str,
+    auth: tuple[str, str] | None = None,
+    timeout: float = 5.0,
+) -> str | None:
+    """Fetch recent error log lines for the camera from /api/logs/frigate.
+
+    Gracefully returns None if unauthorized (401/403), unreachable, or no error found.
+    """
+    url = f"{frigate_url.rstrip('/')}/api/logs/frigate"
+    params = {"start": -50}
+    try:
+        resp = await client.get(url, params=params, auth=auth, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        lines = data.get("lines", [])
+        if not lines:
+            return None
+
+        cam_lower = camera.lower()
+
+        for line in reversed(lines):
+            line_str = str(line)
+            line_lower = line_str.lower()
+            if cam_lower in line_lower:
+                if any(kw in line_lower for kw in [
+                    "error",
+                    "timed out",
+                    "process is not running",
+                    "unable to read frames",
+                    "terminating",
+                    "exiting",
+                ]):
+                    if "  " in line_str:
+                        line_str = line_str.split("  ", 1)[1].strip()
+                    return line_str
+    except Exception as exc:
+        logger.debug("Failed to fetch logs for camera %s: %s", camera, exc)
+        return None
+
+    return None
+

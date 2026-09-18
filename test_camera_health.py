@@ -178,3 +178,114 @@ def test_message_formatting():
     assert "RightBackyard is BACK ONLINE" in recovery_msg
     assert "6m 10s" in recovery_msg
     assert "5.0 fps" in recovery_msg
+
+
+def test_startup_grace_period_skips_alerts():
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 30},  # < 60s
+        "cameras": {
+            "cam1": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"}
+        }
+    }
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    assert alerts == []
+    assert "cam1" not in monitor.states  # No state tracked during startup grace
+
+
+def test_evaluate_stats_flags_unusable_and_zero_fps():
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats_failing = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"},
+            "cam2": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": "excellent"},
+        }
+    }
+
+    # At t=1000: first failure detected, pending debounce
+    assert monitor.evaluate_stats(stats_failing, now=1000.0) == []
+    # At t=1060: debounce reached, Alert 1 for cam1
+    alerts = monitor.evaluate_stats(stats_failing, now=1060.0)
+    assert len(alerts) == 1
+    assert alerts[0].camera == "cam1"
+    assert alerts[0].alert_type == "offline"
+
+    # At t=1100: cam1 recovers
+    stats_recovered = {
+        "service": {"uptime": 160},
+        "cameras": {
+            "cam1": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": "excellent"},
+            "cam2": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": "excellent"},
+        }
+    }
+    recovery_alerts = monitor.evaluate_stats(stats_recovered, now=1100.0)
+    assert len(recovery_alerts) == 1
+    assert recovery_alerts[0].camera == "cam1"
+    assert recovery_alerts[0].alert_type == "recovery"
+
+
+def test_evaluate_stats_filters_cameras():
+    # Only monitor cam1
+    monitor = CameraHealthMonitor(monitored_cameras=["cam1"], debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": "excellent"},
+            "cam2": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"},
+        }
+    }
+    # cam2 is failing, but should be ignored because monitored_cameras=["cam1"]
+    assert monitor.evaluate_stats(stats, now=1000.0) == []
+    assert monitor.evaluate_stats(stats, now=1060.0) == []
+    assert "cam2" not in monitor.states
+
+
+@pytest.mark.asyncio
+async def test_fetch_log_error_detail_success():
+    import httpx
+    from camera_health import fetch_log_error_detail
+
+    sample_logs = {
+        "totalLines": 5,
+        "lines": [
+            "2026-09-18 16:54:50  [INFO] [watchdog.Garage] Checking camera status",
+            "2026-09-18 16:54:58  [ERROR] [ffmpeg.RightBackyard.record] [in#0/rtsp @ 0x5c1c27993e80] Error during demuxing: Connection timed out",
+            "2026-09-18 16:55:00  [ERROR] [frigate.video] RightBackyard: Unable to read frames from ffmpeg process.",
+        ]
+    }
+
+    async def mock_handler(request: httpx.Request):
+        assert request.url.path == "/api/logs/frigate"
+        return httpx.Response(200, json=sample_logs)
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        detail = await fetch_log_error_detail(client, "http://frigate:5000", "RightBackyard")
+        assert detail is not None
+        # Returns the latest relevant error
+        assert "Unable to read frames from ffmpeg process" in detail or "Connection timed out" in detail
+
+
+@pytest.mark.asyncio
+async def test_fetch_log_error_detail_fallback():
+    import httpx
+    from camera_health import fetch_log_error_detail
+
+    # Test 403 Forbidden (no admin permissions)
+    async def mock_forbidden(request: httpx.Request):
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    transport = httpx.MockTransport(mock_forbidden)
+    async with httpx.AsyncClient(transport=transport) as client:
+        detail = await fetch_log_error_detail(client, "http://frigate:5000", "RightBackyard")
+        assert detail is None
+
+    # Test Network error
+    async def mock_error(request: httpx.Request):
+        raise httpx.ConnectError("Connection refused")
+
+    transport = httpx.MockTransport(mock_error)
+    async with httpx.AsyncClient(transport=transport) as client:
+        detail = await fetch_log_error_detail(client, "http://frigate:5000", "RightBackyard")
+        assert detail is None
