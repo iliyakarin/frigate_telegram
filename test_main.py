@@ -770,5 +770,153 @@ class TestMatchesMonitorConfig(unittest.TestCase):
         with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway"}}, clear=True):
             self.assertFalse(main.matches_monitor_config("front", []))
 
+
+class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        if hasattr(main, "camera_health_monitor"):
+            main.camera_health_monitor.states.clear()
+
+    @patch("main.fetch_review_items", return_value=[])
+    async def test_polling_tick_dispatches_camera_offline_alert(self, mock_reviews):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+
+        stats_offline = {
+            "service": {"uptime": 120},
+            "cameras": {
+                "FrontDoor": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"}
+            }
+        }
+        logs_data = {
+            "lines": [
+                "2026-09-18 16:54:58  [ERROR] [ffmpeg.FrontDoor.record] Error during demuxing: Connection timed out"
+            ]
+        }
+
+        async def mock_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "/api/stats" in url:
+                resp.json.return_value = stats_offline
+            elif "/api/logs/frigate" in url:
+                resp.json.return_value = logs_data
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        http_client = MagicMock()
+        http_client.get = AsyncMock(side_effect=mock_get)
+
+        pending = {}
+        # Tick 1 at t=100 (first failure, debounce pending)
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=100.0)
+        bot.send_message.assert_not_called()
+
+        # Tick 2 at t=165 (65s elapsed > 60s debounce)
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=100.0, now=165.0)
+        bot.send_message.assert_called_once()
+        call_kwargs = bot.send_message.call_args.kwargs
+        self.assertIn("FrontDoor is OFFLINE", call_kwargs["text"])
+        self.assertIn("Error during demuxing: Connection timed out", call_kwargs["text"])
+
+    @patch("main.fetch_review_items", return_value=[])
+    async def test_polling_tick_dispatches_camera_recovery_alert(self, mock_reviews):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+
+        stats_offline = {
+            "service": {"uptime": 120},
+            "cameras": {
+                "FrontDoor": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"}
+            }
+        }
+        stats_online = {
+            "service": {"uptime": 180},
+            "cameras": {
+                "FrontDoor": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": "good"}
+            }
+        }
+
+        current_stats = [stats_offline]
+
+        async def mock_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "/api/stats" in url:
+                resp.json.return_value = current_stats[0]
+            else:
+                resp.json.return_value = {"lines": []}
+            return resp
+
+        http_client = MagicMock()
+        http_client.get = AsyncMock(side_effect=mock_get)
+
+        pending = {}
+        # Trigger initial offline alert
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=100.0)
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=100.0, now=165.0)
+        self.assertEqual(bot.send_message.call_count, 1)
+
+        # Now camera recovers at t=200.0
+        current_stats[0] = stats_online
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=165.0, now=200.0)
+        self.assertEqual(bot.send_message.call_count, 2)
+        recovery_text = bot.send_message.call_args.kwargs["text"]
+        self.assertIn("FrontDoor is BACK ONLINE", recovery_text)
+        self.assertIn("Downtime:", recovery_text)
+
+    async def test_cmd_status_displays_camera_health(self):
+        update = MagicMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        update.effective_chat.send_message = AsyncMock()
+        context = MagicMock()
+
+        # Populate camera health state
+        main.camera_health_monitor.update_camera(
+            camera="FrontDoor", is_failing=False, current_fps=5.0, expected_fps=5.0, now=100.0
+        )
+        main.camera_health_monitor.update_camera(
+            camera="Driveway", is_failing=True, current_fps=0.0, expected_fps=5.0, now=100.0
+        )
+        main.camera_health_monitor.update_camera(
+            camera="Driveway", is_failing=True, current_fps=0.0, expected_fps=5.0, now=165.0
+        )
+
+        await main.cmd_status(update, context)
+        update.effective_chat.send_message.assert_called_once()
+        text = update.effective_chat.send_message.call_args.kwargs.get("text") or update.effective_chat.send_message.call_args.args[0]
+        self.assertIn("Camera Health", text)
+        self.assertIn("FrontDoor", text)
+        self.assertIn("Driveway", text)
+
+    @patch("main.fetch_camera_list")
+    async def test_cmd_cameras_displays_camera_health(self, mock_fetch_cameras):
+        mock_fetch_cameras.return_value = ["FrontDoor", "Driveway"]
+        update = MagicMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        update.effective_chat.send_message = AsyncMock()
+        context = MagicMock()
+        context.bot_data = {"http_client": AsyncMock()}
+
+        # FrontDoor healthy, Driveway failing
+        main.camera_health_monitor.update_camera(
+            camera="FrontDoor", is_failing=False, current_fps=5.0, expected_fps=5.0, now=100.0
+        )
+        main.camera_health_monitor.update_camera(
+            camera="Driveway", is_failing=True, current_fps=0.0, expected_fps=5.0, now=100.0
+        )
+        main.camera_health_monitor.update_camera(
+            camera="Driveway", is_failing=True, current_fps=0.0, expected_fps=5.0, now=165.0
+        )
+
+        await main.cmd_cameras(update, context)
+        update.effective_chat.send_message.assert_called_once()
+        text = update.effective_chat.send_message.call_args.kwargs.get("text") or update.effective_chat.send_message.call_args.args[0]
+        self.assertIn("FrontDoor", text)
+        self.assertIn("Driveway", text)
+        self.assertIn("Online", text)
+        self.assertIn("Offline", text)
+
+
 if __name__ == "__main__":
     unittest.main()

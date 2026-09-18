@@ -21,6 +21,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
+from camera_health import (
+    CameraHealthMonitor,
+    fetch_log_error_detail,
+    format_downtime,
+    parse_monitored_cameras,
+)
 from grouping import PendingGroup, merge_into_pending, split_ready_groups
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, BotCommand
 from telegram.constants import ParseMode, ChatAction
@@ -83,6 +89,9 @@ def mask_url(url: str) -> str:
 
 
 MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
+HEALTH_MONITOR_CAMERAS_RAW = os.environ.get("HEALTH_MONITOR_CAMERAS", "")
+HEALTH_MONITOR_CAMERAS = parse_monitored_cameras(HEALTH_MONITOR_CAMERAS_RAW)
+camera_health_monitor = CameraHealthMonitor(monitored_cameras=HEALTH_MONITOR_CAMERAS, debounce_seconds=60)
 
 POLLING_INTERVAL = get_int_setting("POLLING_INTERVAL", 60)
 
@@ -935,19 +944,38 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status_emoji = "🔔" if state.enabled else "🔕"
     status_text = "Enabled" if state.enabled else "Disabled"
     cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "All Cameras"
+    health_cams = ", ".join(HEALTH_MONITOR_CAMERAS) if HEALTH_MONITOR_CAMERAS else "All Cameras"
+
+    health_lines = []
+    if camera_health_monitor.states:
+        for cam, cstate in sorted(camera_health_monitor.states.items()):
+            if cstate.is_offline:
+                downtime = format_downtime(time.time() - (cstate.first_failure_ts or time.time()))
+                health_lines.append(f"• <code>{html.escape(cam)}</code>: 🔴 Offline ({cstate.current_fps:.1f} fps) - Down for {downtime}")
+            else:
+                health_lines.append(f"• <code>{html.escape(cam)}</code>: 🟢 Online ({cstate.current_fps:.1f} fps)")
+
     lines = [
         "📊 <b>Bot Status</b>",
         "",
         f"<b>Notifications:</b> {status_emoji} {status_text}",
         f"<b>Polling Interval:</b> ⏱ {POLLING_INTERVAL}s",
         f"<b>Monitored Cameras:</b> 🎥 {html.escape(cameras)}",
+        f"<b>Health Monitored:</b> 🩺 {html.escape(health_cams)}",
+    ]
+    if health_lines:
+        lines.append("")
+        lines.append("📹 <b>Camera Health:</b>")
+        lines.extend(health_lines)
+
+    lines.extend([
         "",
         "🛠 <b>Configuration</b>",
         f"<b>Frigate URL:</b> 🔗 {html.escape(mask_url(FRIGATE_URL))}",
         f"<b>External URL:</b> 🌐 {html.escape(mask_url(EXTERNAL_URL)) if EXTERNAL_URL else 'Not configured'}",
         f"<b>Frigate Timeout:</b> ⏳ {FRIGATE_TIMEOUT}s",
         f"<b>Upload Timeout:</b> 📤 {UPLOAD_TIMEOUT}s",
-    ]
+    ])
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -961,7 +989,14 @@ async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     lines = ["<b>Registered Cameras:</b>", ""]
     for cam in cameras:
-        lines.append(f"• <code>{html.escape(cam)}</code>")
+        cstate = camera_health_monitor.states.get(cam)
+        if cstate and cstate.is_offline:
+            indicator = "🔴 Offline"
+        elif cstate:
+            indicator = "🟢 Online"
+        else:
+            indicator = "🟢 Online"
+        lines.append(f"• <code>{html.escape(cam)}</code>: {indicator}")
 
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1335,6 +1370,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ─────────────────────── Main Polling Loop ───────────────────────────
 
 
+async def check_camera_health_and_alert(
+    bot: Bot,
+    client: httpx.AsyncClient,
+    now: float | None = None,
+) -> None:
+    """Evaluate Frigate camera stats and dispatch Telegram alerts on failures or recoveries."""
+    if now is None:
+        now = time.time()
+
+    try:
+        req = client.get(f"{FRIGATE_URL}/api/stats", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
+        if asyncio.iscoroutine(req) or hasattr(req, "__await__"):
+            resp = await req
+        else:
+            return
+        if resp.status_code != 200:
+            logger.debug("Frigate /api/stats returned HTTP %s", resp.status_code)
+            return
+        stats_data = resp.json()
+    except Exception as exc:
+        logger.debug("Failed to fetch Frigate stats for health check: %s", exc)
+        return
+
+    alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
+    for alert in alerts:
+        if alert.alert_type == "offline":
+            try:
+                log_req = fetch_log_error_detail(client, FRIGATE_URL, alert.camera, auth=_http_auth())
+                if asyncio.iscoroutine(log_req) or hasattr(log_req, "__await__"):
+                    detail = await log_req
+                else:
+                    detail = None
+                if detail:
+                    cstate = camera_health_monitor.states.get(alert.camera)
+                    if cstate:
+                        cstate.last_error_detail = detail
+                        alert.message = camera_health_monitor.format_offline_alert(
+                            camera=alert.camera,
+                            current_fps=cstate.current_fps,
+                            expected_fps=cstate.expected_fps,
+                            alert_count=alert.alert_count,
+                            error_detail=detail,
+                        )
+            except Exception as exc:
+                logger.debug("Failed to fetch log error detail for %s: %s", alert.camera, exc)
+
+        try:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=alert.message,
+                parse_mode=ParseMode.HTML,
+                **TELEGRAM_TIMEOUT_KWARGS,
+            )
+        except Exception as exc:
+            logger.error("Failed to send camera health alert for %s: %s", alert.camera, exc)
+
+
 async def _polling_tick(
     bot: Bot,
     http_client: httpx.AsyncClient,
@@ -1349,6 +1441,9 @@ async def _polling_tick(
     """
     if now is None:
         now = time.time()
+
+    # Check camera health and dispatch alerts if due
+    await check_camera_health_and_alert(bot, http_client, now=now)
 
     reviews = await fetch_review_items(http_client, last_poll_ts)
     new_last_poll_ts = time.time()
