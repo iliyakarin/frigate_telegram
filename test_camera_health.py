@@ -241,6 +241,45 @@ def test_evaluate_stats_filters_cameras():
     assert "cam2" not in monitor.states
 
 
+def test_evaluate_stats_handles_null_service_without_raising():
+    """Regression: Frigate can plausibly return `"service": null` during its
+    own startup/restart. evaluate_stats must not raise AttributeError on a
+    key present with value None (dict.get's default only covers a *missing*
+    key, not a null one)."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {"service": None, "cameras": {}}
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    assert alerts == []
+
+
+def test_evaluate_stats_handles_null_cameras_without_raising():
+    """Regression: `"cameras": null` (key present but null) must not raise
+    either, and must be treated as "no cameras to evaluate"."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {"service": {"uptime": 120}, "cameras": None}
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    assert alerts == []
+
+
+def test_evaluate_stats_handles_null_camera_entry_without_raising():
+    """Regression: a single camera's stats sub-dict being null must not
+    raise, and must not stop the remaining cameras from being evaluated."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": None,
+            "cam2": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"},
+        },
+    }
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    # cam1's null entry doesn't raise; cam2 is still evaluated normally
+    # (first pass is pending debounce, so no alert is due yet either way).
+    assert alerts == []
+    assert "cam2" in monitor.states
+    assert monitor.states["cam2"].current_fps == 0.0
+
+
 @pytest.mark.asyncio
 async def test_fetch_log_error_detail_success():
     import httpx

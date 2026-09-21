@@ -353,6 +353,34 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
     @patch("main.fetch_camera_snapshot")
     @patch("main.fetch_recording_clip")
     @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_photo_send_failure_does_not_double_send(
+        self, mock_details, mock_clip, mock_snap
+    ):
+        """Regression: when the clip is unavailable (photo fallback branch)
+        and bot.send_photo itself raises, the failure must propagate rather
+        than being caught by the outer send_video except-block and re-sent
+        a second time with a misleading '(Video upload failed...)' caption
+        — no video was ever attempted on this path."""
+        bot = MagicMock()
+        bot.send_photo = AsyncMock(side_effect=Exception("Telegram photo upload failed"))
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"car"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=100, last_activity_end=110, last_seen_at=110,
+        )
+        mock_details.return_value = {"id": "e1", "label": "car", "zones": [], "start_time": 100, "end_time": 110}
+        mock_clip.return_value = None  # no clip -> photo fallback branch
+        mock_snap.return_value = b"snap_bytes"
+
+        with self.assertRaises(Exception):
+            await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_photo.call_count, 1)
+
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
     async def test_send_grouped_notification_falls_back_to_photo(self, mock_details, mock_clip, mock_snap):
         bot = MagicMock()
         bot.send_photo = AsyncMock()
@@ -646,6 +674,10 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
         EVENT_MERGE_GAP seconds, the next tick finalizes and sends it."""
         bot = MagicMock()
         http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
         mock_send.return_value = None
 
         review = {
@@ -679,6 +711,10 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
     async def test_polling_tick_filters_by_monitor_config(self, mock_fetch_reviews, mock_send):
         bot = MagicMock()
         http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
         review = {
             "id": "rev1",
             "camera": "Backyard",
@@ -702,6 +738,10 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
     ):
         bot = MagicMock()
         http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
         sent_order = []
 
         async def record_send(_bot, group, _client):
@@ -734,6 +774,149 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(sent_order, ["Garage", "Backyard"])
+
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_health_check_crash_does_not_abort_ready_group_send(
+        self, mock_fetch_reviews, mock_send
+    ):
+        """Regression: a malformed /api/stats payload (e.g. Frigate restart
+        returning `"service": null`) must not abort notification processing
+        for the tick. Pre-fix, evaluate_stats() is called unguarded inside
+        check_camera_health_and_alert, so the AttributeError it raises
+        propagates out of _polling_tick and skips fetch_review_items/
+        merge/send entirely for that tick — even for a group that was
+        already fully ready to send."""
+        bot = MagicMock()
+        mock_send.return_value = None
+
+        review = {
+            "id": "rev1",
+            "camera": "Garage",
+            "start_time": 100,
+            "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+
+        healthy_stats = {"service": {"uptime": 120}, "cameras": {}}
+        malformed_stats = {"service": None, "cameras": {}}
+        stats_to_return = [healthy_stats]
+
+        async def mock_get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "/api/stats" in url:
+                resp.json.return_value = stats_to_return[0]
+            else:
+                resp.json.return_value = {}
+            return resp
+
+        http_client = MagicMock()
+        http_client.get = AsyncMock(side_effect=mock_get)
+
+        with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+            # Tick 1: review arrives and is merged/held. Stats are well-formed.
+            mock_fetch_reviews.return_value = [review]
+            pending = {}
+            last_poll_ts = await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=110)
+            self.assertEqual(len(pending), 1)
+            mock_send.assert_not_called()
+
+            # Tick 2: quiet period elapsed -> group is ready. This tick's
+            # /api/stats payload is malformed (a plausible transient shape
+            # during Frigate startup/restart).
+            stats_to_return[0] = malformed_stats
+            mock_fetch_reviews.return_value = []
+            await main._polling_tick(
+                bot, http_client, pending, last_poll_ts=last_poll_ts, now=110 + main.EVENT_MERGE_GAP + 1
+            )
+
+        self.assertEqual(pending, {})
+        mock_send.assert_called_once()
+
+    @patch("main.check_camera_health_and_alert")
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_health_check_runs_after_send_and_survives_earlier_crash(
+        self, mock_fetch_reviews, mock_send, mock_health
+    ):
+        """Regression for the step-2 restructuring: the health check must
+        run after the ready-group send (not before/instead of it, as it
+        does pre-fix), and must still run even when notification processing
+        raises earlier in the tick — proving a try/finally restructuring,
+        not a naive reorder, is what decouples the two directions."""
+        bot = MagicMock()
+        http_client = MagicMock()
+        call_order = []
+
+        async def record_send(*args, **kwargs):
+            call_order.append("send")
+
+        async def record_health(*args, **kwargs):
+            call_order.append("health")
+
+        mock_send.side_effect = record_send
+        mock_health.side_effect = record_health
+
+        ready_review = {
+            "id": "rev1", "camera": "Garage", "start_time": 100, "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+
+        with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+            pending = {}
+            mock_fetch_reviews.return_value = [ready_review]
+            last_poll_ts = await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=110)
+
+            call_order.clear()  # isolate the tick that actually sends
+            mock_fetch_reviews.return_value = []
+            await main._polling_tick(
+                bot, http_client, pending, last_poll_ts=last_poll_ts, now=110 + main.EVENT_MERGE_GAP + 1
+            )
+
+            # Health check must run only after the ready group is sent.
+            self.assertEqual(call_order, ["send", "health"])
+
+            # The health check must still run even if notification
+            # processing raises earlier in the tick (malformed review data).
+            call_order.clear()
+            malformed_review = {"id": "rev_bad", "camera": "Garage", "data": None}
+            mock_fetch_reviews.return_value = [malformed_review]
+            with self.assertRaises(Exception):
+                await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=200)
+
+        self.assertIn("health", call_order)
+
+    @patch("main.check_camera_health_and_alert")
+    @patch("main.fetch_review_items")
+    @patch("asyncio.sleep")
+    async def test_polling_loop_runs_health_check_even_when_notifications_disabled(
+        self, mock_sleep, mock_fetch_reviews, mock_health
+    ):
+        """Regression: /disable must not silently disable camera-health
+        alerts. Today `_polling_tick` (and therefore
+        check_camera_health_and_alert) is only invoked from inside
+        `if state.enabled:` in polling_loop, so disabling notifications
+        also stops health monitoring for as long as it's disabled."""
+        bot = MagicMock()
+        http_client = MagicMock()
+        mock_fetch_reviews.return_value = []
+
+        class _StopLoop(Exception):
+            pass
+
+        mock_sleep.side_effect = _StopLoop()
+
+        original_enabled = main.state._enabled
+        main.state._enabled = False
+        try:
+            with self.assertRaises(_StopLoop):
+                await main.polling_loop(bot, http_client)
+        finally:
+            main.state._enabled = original_enabled
+
+        mock_health.assert_called_once()
+        mock_fetch_reviews.assert_not_called()
 
 
 class TestMatchesMonitorConfig(unittest.TestCase):
@@ -891,14 +1074,15 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
 
     @patch("main.fetch_camera_list")
     async def test_cmd_cameras_displays_camera_health(self, mock_fetch_cameras):
-        mock_fetch_cameras.return_value = ["FrontDoor", "Driveway"]
+        mock_fetch_cameras.return_value = ["FrontDoor", "Driveway", "Backyard"]
         update = MagicMock()
         update.effective_chat.id = main.TELEGRAM_CHAT_ID
         update.effective_chat.send_message = AsyncMock()
         context = MagicMock()
         context.bot_data = {"http_client": AsyncMock()}
 
-        # FrontDoor healthy, Driveway failing
+        # FrontDoor healthy, Driveway failing, Backyard has no tracked
+        # health state at all (never seen in an /api/stats payload yet).
         main.camera_health_monitor.update_camera(
             camera="FrontDoor", is_failing=False, current_fps=5.0, expected_fps=5.0, now=100.0
         )
@@ -908,6 +1092,7 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
         main.camera_health_monitor.update_camera(
             camera="Driveway", is_failing=True, current_fps=0.0, expected_fps=5.0, now=165.0
         )
+        self.assertNotIn("Backyard", main.camera_health_monitor.states)
 
         await main.cmd_cameras(update, context)
         update.effective_chat.send_message.assert_called_once()
@@ -916,6 +1101,12 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Driveway", text)
         self.assertIn("Online", text)
         self.assertIn("Offline", text)
+        # A camera absent from camera_health_monitor.states (cstate is None)
+        # must still be reported Online, not omitted or mis-rendered — this
+        # pins the cstate-is-None branch ahead of collapsing the tautological
+        # if/elif/else into a single ternary.
+        backyard_line = next(line for line in text.splitlines() if "Backyard" in line)
+        self.assertIn("🟢 Online", backyard_line)
 
 
 if __name__ == "__main__":
