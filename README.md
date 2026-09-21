@@ -6,16 +6,16 @@ A Python bot that polls [Frigate NVR](https://frigate.video/) for detection even
 
 ## ✨ Features
 
-- **Single-message delivery** — full HD video clip + event details in one Telegram message (no spam)
+- **Single-message delivery** — full HD video clip(s) + event details under one shared caption per activity (no spam)
 - **Camera health alerts** — automated detection of disconnected cameras or 0 FPS streams with 60s debounce, repeat escalation schedule (+5m, +60m, +12h, +24h), recovery notifications with downtime tracking, and error log extraction
-- **Event grouping** — merges rapid-fire Frigate events on the same camera into one notification spanning the whole activity, sent in chronological order, instead of several short out-of-order clips (`EVENT_MERGE_GAP`, `MAX_EVENT_SPAN`)
+- **Event grouping** — merges rapid-fire Frigate events on the same camera into one notification spanning the whole activity, sent in chronological order under one shared caption — one video per constituent event (tagged "Event N/M" when more than one), instead of several short out-of-order clips (`EVENT_MERGE_GAP`, `MAX_EVENT_SPAN`)
 - **Face recognition** — displays recognized names from Frigate's `sub_label` field
 - **Multi-camera matrix** — monitor specific cameras and zones via `MONITOR_CONFIG`
 - **Cloudflare Tunnel support** — `EXTERNAL_URL` for secure public event links
 - **Toggle notifications** — `/enable`, `/disable`, `/status`, and `/help` commands
 - **Persistent state** — notification toggle survives container restarts (JSON file)
 - **Retry logic** — automatically retries media fetches if Frigate hasn't generated them yet
-- **Graceful fallback** — HD video → snapshot → text-only if media isn't available
+- **Graceful fallback** — HD video → GIF preview → snapshot → text-only if media isn't available
 - **Tunnel-safe timeouts** — configurable `UPLOAD_TIMEOUT` for slow connections
 - **Optimized Docker image** — slim Python base, ~60MB
 
@@ -59,7 +59,7 @@ docker compose logs -f
 | `POLLING_INTERVAL` | ❌ | `60` | Seconds between polls |
 | `EVENT_MERGE_GAP` | ❌ | `45` | Seconds of quiet before finalizing a notification — related activity on the same camera within this gap gets merged into one message |
 | `MAX_EVENT_SPAN` | ❌ | `300` | Hard cap (seconds) on a merged notification's duration, so continuously recurring activity still gets sent eventually |
-| `CLIP_PADDING_SECONDS` | ❌ | `5` | Extra seconds included before the activity starts and after it ends in the sent clip |
+| `CLIP_PADDING_SECONDS` | ❌ | `5` | Extra seconds included before each event starts and after it ends in that event's sent clip |
 | `UPLOAD_TIMEOUT` | ❌ | `60` | Seconds for Telegram upload timeout (increase for slow tunnels) |
 | `TIMEZONE` | ❌ | `UTC` | Timezone for timestamps (e.g. `America/Chicago`) |
 | `LOCALES` | ❌ | `en-US` | Locale for date formatting |
@@ -263,7 +263,7 @@ If no face is recognized:
 🎬 Download Event Clip
 ```
 
-The animated GIF preview is attached as the main media of the message.
+If no video clip is available, the message falls back to an animated GIF preview of the event, then a snapshot photo, then text-only.
 
 ## 📄 License
 

@@ -1,7 +1,7 @@
 """
 Frigate-Telegram Bot — Python 3.11+
-Polls the Frigate HTTP API for detection events and sends rich notifications
-to Telegram as a single animated GIF message with event details in the caption.
+Polls the Frigate HTTP API for detection events and sends rich video/photo
+notifications to Telegram with event details in the caption.
 """
 
 import asyncio
@@ -145,6 +145,7 @@ EVENT_MEDIA_CONFIG = {
     "clip": ("clip.mp4", "video/mp4"),
     "thumbnail": ("thumbnail.jpg", "image/jpeg"),
     "snapshot": ("snapshot.jpg", "image/jpeg"),
+    "gif": ("preview.gif", "image/gif"),
 }
 
 # ─────────────────────────── Logging ─────────────────────────────────
@@ -781,6 +782,20 @@ async def _send_fallback_photo(bot: Bot, photo_data: bytes, caption: str) -> Non
     )
 
 
+async def _send_fallback_gif(bot: Bot, gif_data: bytes, caption: str) -> None:
+    """Shared send_animation call shape for send_grouped_notification's two
+    gif-fallback branches (clip missing/too-large, and send_video raised).
+    A failure here propagates to the caller — it is not swallowed here."""
+    await bot.send_animation(
+        chat_id=TELEGRAM_CHAT_ID,
+        animation=gif_data,
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        filename="preview.gif",
+        **TELEGRAM_TIMEOUT_KWARGS,
+    )
+
+
 async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: httpx.AsyncClient) -> None:
     """Send a **single** consolidated Telegram message for a notification group.
 
@@ -789,21 +804,30 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
     1. Fetch each constituent event's own details (real start/end/label/
        zones/sub_label — the review item's own bounds aren't always tight).
     2. Aggregate: union labels/zones/recognized-names, earliest start →
-       latest end across all constituent events.
-    3. Build the clip via fetch_recording_clip over that union window — a
-       real continuous recording, not a per-event preview that may only
-       cover part of the activity. Falls back to the pre-generated event
-       clip if the recording endpoint has nothing yet.
+       latest end across all constituent events (caption only).
+    3. Build a clip PER EVENT, over that event's own start/end window —
+       never one clip spanning the merged group's union window. Frigate's
+       recording retention here only persists motion-flagged segments with
+       a small pre/post capture buffer, not continuous footage, so a union
+       window spanning a multi-event gap (or the whole merged duration)
+       comes back empty even though each event's own tight window is
+       reliably stored. Falls back to the pre-generated per-event clip if
+       the recording endpoint has nothing for that event's window.
     4. Photo fallback is event-anchored: event snapshot.jpg → event
        thumbnail.jpg → live camera frame (last resort — by send time the
        subject may already have left the live frame).
-    5. Send ONE message: video → photo → text-only, same fallback shape
-       as before.
+    5. Send ONE message: video(s) → GIF (event preview.gif, only fetched
+       once no clip is available at all) → photo → text-only. Multiple
+       successful per-event clips are sent as separate videos tagged
+       "(Event N/M)"; an individual event's clip that still exceeds
+       Telegram's 50MB limit is split into two time-halves of that event's
+       own window.
     """
     details_list = await asyncio.gather(
         *[fetch_event_details(http_client, event_id) for event_id in group.event_ids]
     )
     details_list = [d for d in details_list if d]
+    details_list.sort(key=lambda d: d.get("start_time") or 0)
 
     now = time.time()
     starts = [d["start_time"] for d in details_list if d.get("start_time")]
@@ -837,53 +861,90 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         "primary_event_id": primary_event_id,
     })
 
-    padded_start = max(0, int(union_start) - CLIP_PADDING_SECONDS)
-    padded_end = int(union_end) + CLIP_PADDING_SECONDS
-    # Fetch the clip and snapshot concurrently — the snapshot is only used
-    # as a video thumbnail or as the fallback photo, so it never needs to
-    # wait on the clip fetch to start. Removes serial latency only; what's
-    # fetched and how it's used below is unchanged.
-    #
+    # One clip fetch per constituent event, over that event's own tight
+    # start/end window (see docstring point 3 for why). Events with no
+    # resolved details (fetch_event_details failed) have no window to try
+    # the recording endpoint with — go straight to the pre-generated clip.
+    events_for_clips = [(d["id"], d.get("start_time"), d.get("end_time")) for d in details_list] or [
+        (event_id, None, None) for event_id in group.event_ids
+    ]
+
+    async def _fetch_event_clip(event_id: str, start: float | None, end: float | None) -> bytes | None:
+        if start is None:
+            return await fetch_event_media(http_client, event_id, "clip")
+        pad_start = max(0, int(start) - CLIP_PADDING_SECONDS)
+        pad_end = int(end or start) + CLIP_PADDING_SECONDS
+        data = await fetch_recording_clip(http_client, group.camera, pad_start, pad_end)
+        return data or await fetch_event_media(http_client, event_id, "clip")
+
+    # Snapshot fetched concurrently with the clips — it's only used as a
+    # video thumbnail or as the fallback photo, never needs to wait on them.
     # Photo priority is event-anchored, not live: fetch_camera_snapshot()
     # hits the camera's *current* live frame, which by send time is 45s+
     # after the event ended (grouping delay) — the subject is long gone.
     # The event's own snapshot.jpg (Frigate's best captured frame of the
     # event) is tried first, then the event thumbnail, and only then the
     # live camera frame as a last resort.
-    clip_data, photo_data = await asyncio.gather(
-        fetch_recording_clip(http_client, group.camera, padded_start, padded_end),
+    *event_clips, photo_data = await asyncio.gather(
+        *[_fetch_event_clip(eid, start, end) for eid, start, end in events_for_clips],
         fetch_event_media(http_client, primary_event_id, "snapshot"),
     )
-    if not clip_data:
-        # Recording-based fetch failed (not-yet-flushed segment, retention
-        # gap) — fall back to Frigate's own pre-generated event clip before
-        # giving up to a photo.
-        clip_data = await fetch_event_media(http_client, primary_event_id, "clip")
     if not photo_data:
         photo_data = await fetch_event_media(http_client, primary_event_id, "thumbnail")
     if not photo_data:
         photo_data = await fetch_camera_snapshot(http_client, group.camera)
 
-    # If the combined clip exceeds Telegram's limit (50MB), split into two parts
-    clips_to_send: list[tuple[bytes, str]] = []
-    if clip_data:
-        if len(clip_data) <= MAX_TELEGRAM_FILE_SIZE:
-            clips_to_send.append((clip_data, caption))
-        else:
-            mid = padded_start + (padded_end - padded_start) // 2
-            if mid > padded_start and padded_end > mid:
-                logger.info(
-                    "Clip for %s (%d bytes) exceeds %d MB limit; splitting into 2 parts",
-                    group.camera, len(clip_data), MAX_TELEGRAM_FILE_SIZE // (1024 * 1024),
-                )
-                clip1_task = fetch_recording_clip(http_client, group.camera, padded_start, mid)
-                clip2_task = fetch_recording_clip(http_client, group.camera, mid, padded_end)
-                clip1, clip2 = await asyncio.gather(clip1_task, clip2_task)
+    # Resolve each successful event to the video part(s) it actually
+    # contributes — an event whose clip is oversized AND unsplittable (no
+    # window) or whose split halves both fail contributes none. The
+    # "(Event N/M)" tag is built from events that actually contribute below,
+    # not from `successful`, so it never promises a video that never arrives.
+    successful = [(eid, s, e, data) for (eid, s, e), data in zip(events_for_clips, event_clips) if data]
+    event_parts: list[tuple[str, list[tuple[bytes, str]]]] = []
+    for eid, s, e, data in successful:
+        if len(data) <= MAX_TELEGRAM_FILE_SIZE:
+            event_parts.append((eid, [(data, "")]))
+            continue
+        # Individual event's own clip still exceeds 50MB — split it into
+        # two time-halves of its own window (needs a real window; a
+        # pre-generated clip fetched without one can't be split by time).
+        if s is None:
+            logger.warning("Clip for event %s on %s exceeds size limit with no window to split", eid, group.camera)
+            event_parts.append((eid, []))
+            continue
+        pad_start = max(0, int(s) - CLIP_PADDING_SECONDS)
+        pad_end = int(e or s) + CLIP_PADDING_SECONDS
+        mid = pad_start + (pad_end - pad_start) // 2
+        parts: list[tuple[bytes, str]] = []
+        if mid > pad_start and pad_end > mid:
+            logger.info(
+                "Clip for event %s on %s (%d bytes) exceeds %d MB limit; splitting into 2 parts",
+                eid, group.camera, len(data), MAX_TELEGRAM_FILE_SIZE // (1024 * 1024),
+            )
+            clip1, clip2 = await asyncio.gather(
+                fetch_recording_clip(http_client, group.camera, pad_start, mid),
+                fetch_recording_clip(http_client, group.camera, mid, pad_end),
+            )
+            if clip1 and len(clip1) <= MAX_TELEGRAM_FILE_SIZE:
+                parts.append((clip1, "\n\n📹 <i>(Part 1/2)</i>"))
+            if clip2 and len(clip2) <= MAX_TELEGRAM_FILE_SIZE:
+                parts.append((clip2, "\n\n📹 <i>(Part 2/2)</i>"))
+        event_parts.append((eid, parts))
 
-                if clip1 and len(clip1) <= MAX_TELEGRAM_FILE_SIZE:
-                    clips_to_send.append((clip1, f"{caption}\n\n📹 <i>(Part 1/2)</i>"))
-                if clip2 and len(clip2) <= MAX_TELEGRAM_FILE_SIZE:
-                    clips_to_send.append((clip2, f"{caption}\n\n📹 <i>(Part 2/2)</i>"))
+    contributing = [(eid, parts) for eid, parts in event_parts if parts]
+    multi_event = len(contributing) > 1
+    clips_to_send: list[tuple[bytes, str]] = []
+    for idx, (eid, parts) in enumerate(contributing, start=1):
+        event_tag = f" <i>(Event {idx}/{len(contributing)})</i>" if multi_event else ""
+        for video_bytes, part_suffix in parts:
+            clips_to_send.append((video_bytes, f"{caption}{event_tag}{part_suffix}"))
+
+    # GIF is the tier between video and photo, but only worth fetching once
+    # no clip is going out at all — the common (clip succeeds) case never
+    # pays for this extra request.
+    gif_data: bytes | None = None
+    if not clips_to_send:
+        gif_data = await fetch_event_media(http_client, primary_event_id, "gif")
 
     if clips_to_send:
         # Narrowly scoped to the send_video call(s) only — a failure here is
@@ -891,6 +952,7 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         # video). photo_data/text failures below propagate normally instead
         # of being caught here, so they're never mistaken for a video
         # failure and never double-sent (see _send_fallback_photo callers).
+        sent_count = 0
         try:
             for i, (video_bytes, cap) in enumerate(clips_to_send):
                 await bot.send_video(
@@ -903,31 +965,53 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
                     supports_streaming=True,
                     **TELEGRAM_TIMEOUT_KWARGS,
                 )
+                sent_count += 1
             logger.info(
                 "Group on %s (%d event(s)) → sent %d video clip(s) with caption ✓",
                 group.camera, len(group.event_ids), len(clips_to_send),
             )
         except Exception as exc:
             logger.error("Failed to send Telegram video notification for group on %s: %s", group.camera, exc)
-            try:
-                if photo_data:
-                    await _send_fallback_photo(
-                        bot, photo_data, f"{caption}\n\n⚠️ <i>(Video upload failed, sent snapshot)</i>"
-                    )
-                    logger.info("Group on %s → fallback photo sent successfully ✓", group.camera)
-                else:
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=f"{caption}\n\n⚠️ <i>(Video upload failed)</i>",
-                        parse_mode=ParseMode.HTML,
-                        **TELEGRAM_TIMEOUT_KWARGS,
-                    )
-            except Exception as fallback_exc:
-                logger.error("Fallback notification also failed for group on %s: %s", group.camera, fallback_exc)
+            if sent_count > 0:
+                # A multi-event group can fail partway through — one or
+                # more videos already reached the user, so a full GIF/
+                # photo/text fallback now would be a confusing duplicate,
+                # not a recovery. Just note the partial delivery.
+                logger.warning(
+                    "Group on %s → %d/%d video clip(s) sent before failure; not sending a duplicate fallback",
+                    group.camera, sent_count, len(clips_to_send),
+                )
+            else:
+                try:
+                    if not gif_data:
+                        gif_data = await fetch_event_media(http_client, primary_event_id, "gif")
+                    if gif_data:
+                        await _send_fallback_gif(
+                            bot, gif_data, f"{caption}\n\n⚠️ <i>(Video upload failed, sent GIF)</i>"
+                        )
+                        logger.info("Group on %s → fallback GIF sent successfully ✓", group.camera)
+                    elif photo_data:
+                        await _send_fallback_photo(
+                            bot, photo_data, f"{caption}\n\n⚠️ <i>(Video upload failed, sent snapshot)</i>"
+                        )
+                        logger.info("Group on %s → fallback photo sent successfully ✓", group.camera)
+                    else:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=f"{caption}\n\n⚠️ <i>(Video upload failed)</i>",
+                            parse_mode=ParseMode.HTML,
+                            **TELEGRAM_TIMEOUT_KWARGS,
+                        )
+                except Exception as fallback_exc:
+                    logger.error("Fallback notification also failed for group on %s: %s", group.camera, fallback_exc)
+
+    elif gif_data:
+        await _send_fallback_gif(bot, gif_data, caption)
+        logger.info("Group on %s → sent GIF with caption (clip unavailable or exceeds size limit)", group.camera)
 
     elif photo_data:
         await _send_fallback_photo(bot, photo_data, caption)
-        logger.info("Group on %s → sent photo with caption (clip unavailable or exceeds size limit)", group.camera)
+        logger.info("Group on %s → sent photo with caption (clip and GIF unavailable or exceed size limit)", group.camera)
 
     else:
         await bot.send_message(

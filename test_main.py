@@ -237,9 +237,13 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
     @patch("main.fetch_camera_snapshot")
     @patch("main.fetch_recording_clip")
     @patch("main.fetch_event_details")
-    async def test_send_grouped_notification_sends_video_with_union_bounds(
+    async def test_send_grouped_notification_fetches_clip_per_event_not_union_window(
         self, mock_details, mock_clip, mock_snap, mock_media
     ):
+        """Regression: a group spanning 2 constituent events must fetch ONE
+        clip per event over that event's own start/end window, not a single
+        clip over the merged union window — Frigate's recording retention
+        doesn't reliably back a window spanning the gap between events."""
         bot = MagicMock()
         bot.send_video = AsyncMock()
         http_client = MagicMock()
@@ -261,21 +265,315 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
             }[event_id]
 
         mock_details.side_effect = details_side_effect
-        mock_clip.return_value = b"clip_bytes"
+
+        async def clip_side_effect(_client, camera, start, end):
+            return {
+                (100 - main.CLIP_PADDING_SECONDS, 130 + main.CLIP_PADDING_SECONDS): b"e1_clip_bytes",
+                (150 - main.CLIP_PADDING_SECONDS, 200 + main.CLIP_PADDING_SECONDS): b"e2_clip_bytes",
+            }[(start, end)]
+
+        mock_clip.side_effect = clip_side_effect
         mock_snap.return_value = b"snap_bytes"
 
         await main.send_grouped_notification(bot, group, http_client)
 
-        # Clip fetched over the union of constituent event bounds padded by
-        # CLIP_PADDING_SECONDS on each side, not the exact/review's own bounds.
-        mock_clip.assert_called_once_with(
-            http_client, "Garage", 100 - main.CLIP_PADDING_SECONDS, 200 + main.CLIP_PADDING_SECONDS
+        # Two separate per-event fetches, each on that event's own tight
+        # window — never one call spanning 100 -> 200 (the union).
+        self.assertEqual(mock_clip.call_count, 2)
+        mock_clip.assert_any_call(http_client, "Garage", 100 - main.CLIP_PADDING_SECONDS, 130 + main.CLIP_PADDING_SECONDS)
+        mock_clip.assert_any_call(http_client, "Garage", 150 - main.CLIP_PADDING_SECONDS, 200 + main.CLIP_PADDING_SECONDS)
+
+        # Two videos sent, chronologically ordered and tagged, aggregate
+        # caption (union labels/zones/names) attached to both.
+        self.assertEqual(bot.send_video.call_count, 2)
+        call1, call2 = bot.send_video.call_args_list
+        self.assertEqual(call1.kwargs["video"], b"e1_clip_bytes")
+        self.assertIn("(Event 1/2)", call1.kwargs["caption"])
+        self.assertEqual(call2.kwargs["video"], b"e2_clip_bytes")
+        self.assertIn("(Event 2/2)", call2.kwargs["caption"])
+        for call_kwargs in (call1.kwargs, call2.kwargs):
+            self.assertIn("Found", call_kwargs["caption"])
+            self.assertIn("driveway, porch", call_kwargs["caption"])
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_sends_only_the_events_whose_clip_succeeded(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """One event's clip fails entirely (recording endpoint AND its own
+        pre-generated clip both empty) while the other's succeeds — only
+        the successful one is sent, untagged (a single successful clip
+        doesn't get an "(Event N/M)" tag even though the group had 2)."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1", "e2"},
+            first_start=100, last_activity_end=200, last_seen_at=200,
         )
+
+        async def details_side_effect(client, event_id):
+            return {
+                "e1": {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 130},
+                "e2": {"id": "e2", "label": "person", "zones": [], "start_time": 150, "end_time": 200},
+            }[event_id]
+
+        mock_details.side_effect = details_side_effect
+        mock_clip.return_value = None  # recording endpoint has nothing for either event
+
+        async def media_side_effect(_client, event_id, media_type, **_kwargs):
+            if media_type == "clip" and event_id == "e1":
+                return b"e1_event_clip_bytes"
+            return None  # e2's own pre-generated clip also fails
+
+        mock_media.side_effect = media_side_effect
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
         bot.send_video.assert_called_once()
         call_kwargs = bot.send_video.call_args.kwargs
-        self.assertEqual(call_kwargs["video"], b"clip_bytes")
-        self.assertIn("Found", call_kwargs["caption"])
-        self.assertIn("driveway, porch", call_kwargs["caption"])
+        self.assertEqual(call_kwargs["video"], b"e1_event_clip_bytes")
+        self.assertNotIn("(Event", call_kwargs["caption"])
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_middle_event_failure_renumbers_around_gap(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """3-event group, the MIDDLE event's clip fails entirely (both
+        recording endpoint and its own pre-generated clip) while the first
+        and last succeed — they're still sent chronologically, tagged
+        "(Event 1/2)"/"(Event 2/2)" by count of what's actually delivered,
+        skipping the failed middle one rather than leaving a numbering gap."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1", "e2", "e3"},
+            first_start=100, last_activity_end=300, last_seen_at=300,
+        )
+
+        async def details_side_effect(client, event_id):
+            return {
+                "e1": {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 130},
+                "e2": {"id": "e2", "label": "person", "zones": [], "start_time": 150, "end_time": 180},
+                "e3": {"id": "e3", "label": "person", "zones": [], "start_time": 250, "end_time": 300},
+            }[event_id]
+
+        mock_details.side_effect = details_side_effect
+
+        async def clip_side_effect(_client, camera, start, end):
+            if (start, end) == (150 - main.CLIP_PADDING_SECONDS, 180 + main.CLIP_PADDING_SECONDS):
+                return None  # e2's recording window fails
+            return {
+                (100 - main.CLIP_PADDING_SECONDS, 130 + main.CLIP_PADDING_SECONDS): b"e1_clip_bytes",
+                (250 - main.CLIP_PADDING_SECONDS, 300 + main.CLIP_PADDING_SECONDS): b"e3_clip_bytes",
+            }[(start, end)]
+
+        mock_clip.side_effect = clip_side_effect
+        mock_media.return_value = None  # e2's pre-generated clip fallback also fails
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_video.call_count, 2)
+        call1, call2 = bot.send_video.call_args_list
+        self.assertEqual(call1.kwargs["video"], b"e1_clip_bytes")
+        self.assertIn("(Event 1/2)", call1.kwargs["caption"])
+        self.assertEqual(call2.kwargs["video"], b"e3_clip_bytes")
+        self.assertIn("(Event 2/2)", call2.kwargs["caption"])
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_drops_oversized_unsplittable_event_keeps_other(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """One event's clip is oversized (fetched via the pre-generated-clip
+        fallback) and its split-into-halves attempt also fails (recording
+        endpoint has nothing for either half); another event's clip is
+        normal size. Only the normal one is sent, and — since exactly one
+        event actually contributes — it's untagged, not mislabeled
+        "(Event 1/2)" for content that never arrives."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1", "e2"},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+
+        async def details_side_effect(client, event_id):
+            return {
+                "e1": {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 130},
+                "e2": {"id": "e2", "label": "person", "zones": [], "start_time": 150, "end_time": 200},
+            }[event_id]
+
+        mock_details.side_effect = details_side_effect
+        mock_clip.return_value = None  # recording endpoint has nothing for either event
+
+        oversized = b"x" * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+
+        async def media_side_effect(_client, event_id, media_type, **_kwargs):
+            if media_type != "clip":
+                return None
+            return oversized if event_id == "e1" else b"e2_event_clip_bytes"
+
+        mock_media.side_effect = media_side_effect
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        bot.send_video.assert_called_once()
+        call_kwargs = bot.send_video.call_args.kwargs
+        self.assertEqual(call_kwargs["video"], b"e2_event_clip_bytes")
+        self.assertNotIn("(Event", call_kwargs["caption"])
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details", return_value=None)
+    async def test_send_grouped_notification_oversized_clip_with_no_window_cannot_split(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """The event's own details fetch failed entirely (no start/end
+        resolved at all), so its clip can only come from the pre-generated
+        fallback with no window (`start=None` in `_fetch_event_clip`) — if
+        that clip is oversized there's no window left to split it into
+        halves, so it's dropped with a warning rather than crashing."""
+        bot = MagicMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=100, last_activity_end=110, last_seen_at=110,
+        )
+        # mock_details returns None -> details_list ends up empty -> the
+        # events_for_clips fallback synthesizes (event_id, None, None).
+
+        async def media_side_effect(_client, event_id, media_type, **_kwargs):
+            if media_type == "clip":
+                return b"x" * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+            return None
+
+        mock_media.side_effect = media_side_effect
+        mock_snap.return_value = b"snap_bytes"
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        mock_clip.assert_not_called()  # no window -> never tries the recording endpoint
+        bot.send_photo.assert_called_once()  # oversized+unsplittable -> falls through to photo
+        self.assertEqual(bot.send_photo.call_args.kwargs["photo"], b"snap_bytes")
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_event_tag_and_part_tag_combine(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """2-event group: event A's clip is normal size (1 part), event B's
+        clip is oversized but splits successfully into 2 parts. The
+        "(Event N/M)" tag and the "(Part X/2)" suffix must combine on B's
+        two videos while A's stays untagged-by-part (single part)."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"eA", "eB"},
+            first_start=100, last_activity_end=305, last_seen_at=305,
+        )
+
+        async def details_side_effect(client, event_id):
+            return {
+                "eA": {"id": "eA", "label": "person", "zones": [], "start_time": 100, "end_time": 110},
+                "eB": {"id": "eB", "label": "person", "zones": [], "start_time": 200, "end_time": 300},
+            }[event_id]
+
+        mock_details.side_effect = details_side_effect
+
+        oversized = b"x" * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
+        pad = main.CLIP_PADDING_SECONDS
+        mid = (200 - pad) + ((300 + pad) - (200 - pad)) // 2  # 250
+
+        async def clip_side_effect(_client, camera, start, end):
+            return {
+                (100 - pad, 110 + pad): b"eventA_bytes",
+                (200 - pad, 300 + pad): oversized,
+                (200 - pad, mid): b"eventB_part1",
+                (mid, 300 + pad): b"eventB_part2",
+            }[(start, end)]
+
+        mock_clip.side_effect = clip_side_effect
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_video.call_count, 3)
+        call1, call2, call3 = bot.send_video.call_args_list
+
+        self.assertEqual(call1.kwargs["video"], b"eventA_bytes")
+        self.assertIn("(Event 1/2)", call1.kwargs["caption"])
+        self.assertNotIn("(Part", call1.kwargs["caption"])
+
+        self.assertEqual(call2.kwargs["video"], b"eventB_part1")
+        self.assertIn("(Event 2/2)", call2.kwargs["caption"])
+        self.assertIn("(Part 1/2)", call2.kwargs["caption"])
+
+        self.assertEqual(call3.kwargs["video"], b"eventB_part2")
+        self.assertIn("(Event 2/2)", call3.kwargs["caption"])
+        self.assertIn("(Part 2/2)", call3.kwargs["caption"])
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_partial_send_failure_does_not_send_duplicate_fallback(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """2-event group: the first video sends successfully, the second
+        raises (e.g. a flood-control blip mid-loop). One video already
+        reached the user, so no GIF/photo/text fallback should follow —
+        that would be a confusing duplicate, not a recovery."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock(side_effect=[None, Exception("flood control")])
+        bot.send_animation = AsyncMock()
+        bot.send_photo = AsyncMock()
+        bot.send_message = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1", "e2"},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+
+        async def details_side_effect(client, event_id):
+            return {
+                "e1": {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 130},
+                "e2": {"id": "e2", "label": "person", "zones": [], "start_time": 150, "end_time": 200},
+            }[event_id]
+
+        mock_details.side_effect = details_side_effect
+        mock_clip.return_value = b"clip_bytes"
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        self.assertEqual(bot.send_video.call_count, 2)  # attempted both; 2nd raised
+        bot.send_animation.assert_not_called()
+        bot.send_photo.assert_not_called()
+        bot.send_message.assert_not_called()
 
     @patch("main.fetch_event_media", return_value=None)
     @patch("main.fetch_camera_snapshot")
@@ -595,6 +893,80 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         mock_media.assert_any_call(http_client, "e1", "clip")
         bot.send_video.assert_called_once()
         self.assertEqual(bot.send_video.call_args.kwargs["video"], b"event_clip_bytes")
+
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_falls_back_to_gif_when_no_clip(
+        self, mock_details, mock_clip, mock_media, mock_snap
+    ):
+        """GIF sits between video and photo: when no clip is available at
+        all (recording endpoint and event clip both empty), the event's
+        preview.gif is preferred over a still photo."""
+        bot = MagicMock()
+        bot.send_animation = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=100, last_activity_end=110, last_seen_at=110,
+        )
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 110}
+        mock_clip.return_value = None  # no clip anywhere
+
+        async def media_side_effect(_client, event_id, media_type, **_kwargs):
+            if media_type == "gif":
+                return b"gif_bytes"
+            if media_type == "snapshot":
+                return b"event_snapshot_bytes"  # available too, but must lose to GIF
+            return None
+
+        mock_media.side_effect = media_side_effect
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        mock_media.assert_any_call(http_client, "e1", "gif")
+        bot.send_animation.assert_called_once()
+        self.assertEqual(bot.send_animation.call_args.kwargs["animation"], b"gif_bytes")
+        bot.send_photo.assert_not_called()
+
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_falls_back_to_gif_on_send_video_exception(
+        self, mock_details, mock_clip, mock_media, mock_snap
+    ):
+        """When a clip DID exist but bot.send_video raised, the fallback
+        also tries GIF before photo — same tier order as the no-clip case."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock(side_effect=Exception("Request Entity Too Large (413)"))
+        bot.send_animation = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+
+        group = grouping.PendingGroup(
+            camera="Garage", labels={"person"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=100, last_activity_end=110, last_seen_at=110,
+        )
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 110}
+        mock_clip.return_value = b"clip_bytes"  # clip existed; upload failed instead
+
+        async def media_side_effect(_client, event_id, media_type, **_kwargs):
+            return b"gif_bytes" if media_type == "gif" else None
+
+        mock_media.side_effect = media_side_effect
+        mock_snap.return_value = None
+
+        await main.send_grouped_notification(bot, group, http_client)
+
+        mock_media.assert_any_call(http_client, "e1", "gif")
+        bot.send_animation.assert_called_once()
+        self.assertEqual(bot.send_animation.call_args.kwargs["animation"], b"gif_bytes")
+        bot.send_photo.assert_not_called()
 
     @patch("main._http_auth")
     async def test_fetch_recent_events(self, mock_auth):
