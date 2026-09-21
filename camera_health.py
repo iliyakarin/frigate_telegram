@@ -324,8 +324,14 @@ class CameraHealthMonitor:
 
             data = data or {}
             current_fps = float(data.get("camera_fps") or 0.0)
-            expected_fps = float(data.get("expected_fps") or 5.0)
-            connection_quality = str(data.get("connection_quality", "")).lower()
+            # `is None` (not `or`) here: unlike camera_fps/uptime, the
+            # default (5.0) doesn't equal the legit-zero value, so `or`
+            # would wrongly mask a real `expected_fps: 0`.
+            raw_expected_fps = data.get("expected_fps")
+            expected_fps = (
+                float(raw_expected_fps) if raw_expected_fps is not None else 5.0
+            )
+            connection_quality = str(data.get("connection_quality") or "").lower()
 
             # Flagged as failing if fps < 0.1 or connection unusable
             is_failing = (current_fps < 0.1) or (connection_quality == "unusable")

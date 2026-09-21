@@ -305,6 +305,35 @@ def test_evaluate_stats_handles_null_camera_fps_without_raising():
     assert monitor.states["cam1"].current_fps == 0.0
 
 
+def test_evaluate_stats_preserves_legit_zero_expected_fps():
+    """Regression: `expected_fps: 0` is a legitimate value (e.g. detection
+    paused), not a missing one. `or 5.0` would wrongly mask it as 5.0 -
+    only an explicit `is None` check preserves the real 0."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": {"camera_fps": 0.0, "expected_fps": 0, "connection_quality": "unusable"},
+        },
+    }
+    monitor.evaluate_stats(stats, now=1000.0)
+    assert monitor.states["cam1"].expected_fps == 0.0
+
+
+def test_evaluate_stats_handles_null_connection_quality_without_raising():
+    """Regression: `"connection_quality": null` must not raise, and must
+    not spuriously match the "unusable" failing condition."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": {"camera_fps": 5.0, "expected_fps": 5.0, "connection_quality": None},
+        },
+    }
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    assert alerts == []
+
+
 @pytest.mark.asyncio
 async def test_fetch_log_error_detail_success():
     import httpx
