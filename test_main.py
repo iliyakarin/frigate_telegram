@@ -28,6 +28,14 @@ os.environ["STATE_FILE"] = "state.json"
 import main
 import grouping
 
+
+def _epoch_at(hour, minute):
+    """Build a tz-aware epoch (per main._CACHED_TZ, i.e. TIMEZONE) for a
+    given local hour/minute — never a bare naive datetime.timestamp(),
+    which would silently use the test-runner machine's local timezone."""
+    return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
+
+
 class TestMainLogic(unittest.TestCase):
     def test_format_caption_escaping(self):
         event = {
@@ -958,12 +966,6 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
         mock_health.assert_called_once()
         mock_fetch_reviews.assert_not_called()
 
-    @staticmethod
-    def _epoch_at(hour, minute):
-        """tz-aware epoch (per main._CACHED_TZ, i.e. TIMEZONE) for a given
-        local hour/minute — see TestMatchesNightAlertSchedule._epoch_at."""
-        return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
-
     @patch("main.send_grouped_notification")
     @patch("main.fetch_review_items")
     async def test_polling_tick_suppresses_night_alert_camera_outside_window(
@@ -991,7 +993,7 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
-            now = self._epoch_at(12, 0)  # outside the 22:00-06:00 window
+            now = _epoch_at(12, 0)  # outside the 22:00-06:00 window
 
             with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
                 pending = {}
@@ -1032,7 +1034,7 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
-            now = self._epoch_at(23, 0)  # inside the 22:00-06:00 window
+            now = _epoch_at(23, 0)  # inside the 22:00-06:00 window
             # Anchor the review's start/end to `now` (a real tz-aware 2024
             # epoch) rather than the tiny 100/110 placeholders used
             # elsewhere in this file — otherwise (now - first_start) would
@@ -1083,7 +1085,7 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
-            now = self._epoch_at(12, 0)  # outside indoor_hallway's window
+            now = _epoch_at(12, 0)  # outside indoor_hallway's window
             # See comment in test_polling_tick_allows_night_alert_camera_inside_window:
             # anchor start/end to `now` so the group doesn't instantly exceed
             # MAX_EVENT_SPAN and finalize before this assertion runs.
@@ -1138,12 +1140,6 @@ class TestMatchesMonitorConfig(unittest.TestCase):
 
 
 class TestMatchesNightAlertSchedule(unittest.TestCase):
-    @staticmethod
-    def _epoch_at(hour, minute):
-        """Build a tz-aware epoch (per main._CACHED_TZ, i.e. TIMEZONE) for a
-        given local hour/minute — never a bare naive datetime.timestamp(),
-        which would silently use the test-runner machine's local timezone."""
-        return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
 
     def test_camera_not_in_night_alert_cameras_is_always_allowed(self):
         original_cameras = main.NIGHT_ALERT_CAMERAS
@@ -1156,7 +1152,7 @@ class TestMatchesNightAlertSchedule(unittest.TestCase):
             # now is clearly outside any night window (midday); unlisted
             # camera must still be allowed — the feature is a true no-op
             # for cameras not in NIGHT_ALERT_CAMERAS.
-            now = self._epoch_at(12, 0)
+            now = _epoch_at(12, 0)
             self.assertTrue(main.matches_night_alert_schedule("front_door", now))
         finally:
             main.NIGHT_ALERT_CAMERAS = original_cameras
@@ -1171,7 +1167,7 @@ class TestMatchesNightAlertSchedule(unittest.TestCase):
             main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
-            now = self._epoch_at(23, 0)  # inside the 22:00-06:00 window
+            now = _epoch_at(23, 0)  # inside the 22:00-06:00 window
             self.assertTrue(main.matches_night_alert_schedule("indoor_hallway", now))
         finally:
             main.NIGHT_ALERT_CAMERAS = original_cameras
@@ -1186,7 +1182,7 @@ class TestMatchesNightAlertSchedule(unittest.TestCase):
             main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
-            now = self._epoch_at(12, 0)  # outside the 22:00-06:00 window
+            now = _epoch_at(12, 0)  # outside the 22:00-06:00 window
             self.assertFalse(main.matches_night_alert_schedule("indoor_hallway", now))
         finally:
             main.NIGHT_ALERT_CAMERAS = original_cameras
@@ -1206,7 +1202,7 @@ class TestMatchesNightAlertSchedule(unittest.TestCase):
             main.NIGHT_ALERT_START = dt_time(8, 0)
             main.NIGHT_ALERT_END = dt_time(8, 0)
             for hour, minute in [(8, 0), (12, 0), (23, 59), (0, 0)]:
-                now = self._epoch_at(hour, minute)
+                now = _epoch_at(hour, minute)
                 self.assertFalse(main.matches_night_alert_schedule("indoor_hallway", now))
         finally:
             main.NIGHT_ALERT_CAMERAS = original_cameras
@@ -1412,6 +1408,10 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
         text = update.effective_chat.send_message.call_args.kwargs.get("text") or update.effective_chat.send_message.call_args.args[0]
         self.assertIn("Night Alert Cameras", text)
         self.assertIn("None configured", text)
+        # Window suffix must not render when the feature is off (empty camera set) —
+        # otherwise "None configured (22:00-06:00)" misleadingly implies an active window.
+        self.assertNotIn("22:00", text)
+        self.assertNotIn("06:00", text)
 
 
 if __name__ == "__main__":

@@ -998,7 +998,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status_text = "Enabled" if state.enabled else "Disabled"
     cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "All Cameras"
     health_cams = ", ".join(HEALTH_MONITOR_CAMERAS) if HEALTH_MONITOR_CAMERAS else "All Cameras"
-    night_cams = ", ".join(sorted(NIGHT_ALERT_CAMERAS)) if NIGHT_ALERT_CAMERAS else "None configured"
+    if NIGHT_ALERT_CAMERAS:
+        night_cams = f"{', '.join(sorted(NIGHT_ALERT_CAMERAS))} ({NIGHT_ALERT_START.strftime('%H:%M')}–{NIGHT_ALERT_END.strftime('%H:%M')})"
+    else:
+        night_cams = "None configured"
 
     health_lines = []
     if camera_health_monitor.states:
@@ -1016,7 +1019,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>Polling Interval:</b> ⏱ {POLLING_INTERVAL}s",
         f"<b>Monitored Cameras:</b> 🎥 {html.escape(cameras)}",
         f"<b>Health Monitored:</b> 🩺 {html.escape(health_cams)}",
-        f"<b>Night Alert Cameras:</b> 🌙 {html.escape(night_cams)} ({NIGHT_ALERT_START.strftime('%H:%M')}–{NIGHT_ALERT_END.strftime('%H:%M')})",
+        f"<b>Night Alert Cameras:</b> 🌙 {html.escape(night_cams)}",
     ]
     if health_lines:
         lines.append("")
