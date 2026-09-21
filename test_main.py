@@ -16,6 +16,7 @@ for mod in ["telegram", "telegram.constants", "telegram.ext", "dotenv"]:
 
 import unittest
 import os
+from datetime import datetime, time as dt_time
 from unittest.mock import AsyncMock, patch
 
 # Set environment variables for main.py import
@@ -82,6 +83,45 @@ class TestMainLogic(unittest.TestCase):
         ]
         for raw, expected in cases:
             self.assertEqual(main.parse_monitor_config(raw), expected)
+
+    def test_parse_hhmm(self):
+        cases = [
+            ("22:00", dt_time(22, 0)),
+            ("06:00", dt_time(6, 0)),
+            ("00:00", dt_time(0, 0)),
+            ("23:59", dt_time(23, 59)),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(main.parse_hhmm(raw, "22:00"), expected)
+
+    def test_parse_hhmm_falls_back_to_default_on_invalid_input(self):
+        with self.assertLogs(main.logger.name, level="WARNING"):
+            result = main.parse_hhmm("not-a-time", "22:00")
+        self.assertEqual(result, dt_time(22, 0))
+
+    def test_in_night_window_non_wrapping(self):
+        start, end = dt_time(9, 0), dt_time(17, 0)
+        cases = [
+            (dt_time(12, 0), True),
+            (dt_time(8, 0), False),
+            (dt_time(18, 0), False),
+            (dt_time(9, 0), True),   # start boundary, inclusive
+            (dt_time(17, 0), False),  # end boundary, exclusive
+        ]
+        for now_local, expected in cases:
+            self.assertEqual(main.in_night_window(now_local, start, end), expected)
+
+    def test_in_night_window_midnight_crossing(self):
+        start, end = dt_time(22, 0), dt_time(6, 0)
+        cases = [
+            (dt_time(23, 0), True),
+            (dt_time(2, 0), True),
+            (dt_time(12, 0), False),
+            (dt_time(22, 0), True),  # start boundary
+            (dt_time(6, 0), False),  # end boundary, exclusive
+        ]
+        for now_local, expected in cases:
+            self.assertEqual(main.in_night_window(now_local, start, end), expected)
 
     def test_format_caption_sub_label_dict(self):
         event = {
@@ -918,6 +958,137 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
         mock_health.assert_called_once()
         mock_fetch_reviews.assert_not_called()
 
+    @staticmethod
+    def _epoch_at(hour, minute):
+        """tz-aware epoch (per main._CACHED_TZ, i.e. TIMEZONE) for a given
+        local hour/minute — see TestMatchesNightAlertSchedule._epoch_at."""
+        return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
+
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_polling_tick_suppresses_night_alert_camera_outside_window(
+        self, mock_fetch_reviews, mock_send
+    ):
+        bot = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
+        review = {
+            "id": "rev1",
+            "camera": "indoor_hallway",
+            "start_time": 100,
+            "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+        mock_fetch_reviews.return_value = [review]
+
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            now = self._epoch_at(12, 0)  # outside the 22:00-06:00 window
+
+            with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+                pending = {}
+                await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=now)
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+        # Suppressed before grouping: never held, never sent.
+        self.assertEqual(pending, {})
+        mock_send.assert_not_called()
+
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_polling_tick_allows_night_alert_camera_inside_window(
+        self, mock_fetch_reviews, mock_send
+    ):
+        bot = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
+        review = {
+            "id": "rev1",
+            "camera": "indoor_hallway",
+            "start_time": 100,
+            "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+        mock_fetch_reviews.return_value = [review]
+
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            now = self._epoch_at(23, 0)  # inside the 22:00-06:00 window
+
+            with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+                pending = {}
+                await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=now)
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+        # Held pending (not yet sent — quiet period hasn't elapsed), but
+        # not suppressed: the review reached merge_into_pending.
+        self.assertEqual(len(pending), 1)
+
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_polling_tick_camera_not_in_night_alert_list_is_unaffected(
+        self, mock_fetch_reviews, mock_send
+    ):
+        """Regression guard: a camera absent from NIGHT_ALERT_CAMERAS must be
+        processed regardless of `now`, even at a `now` that would suppress a
+        listed camera."""
+        bot = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
+        review = {
+            "id": "rev1",
+            "camera": "Garage",
+            "start_time": 100,
+            "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+        mock_fetch_reviews.return_value = [review]
+
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            now = self._epoch_at(12, 0)  # outside indoor_hallway's window
+
+            with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+                pending = {}
+                await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=now)
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+        # Garage isn't in NIGHT_ALERT_CAMERAS, so it must still be held.
+        self.assertEqual(len(pending), 1)
+
 
 class TestMatchesMonitorConfig(unittest.TestCase):
     def test_matches_monitor_config(self):
@@ -952,6 +1123,83 @@ class TestMatchesMonitorConfig(unittest.TestCase):
         # 8. Missing zones field (defaults to [])
         with patch.dict(main.MONITOR_CONFIG, {"front": {"driveway"}}, clear=True):
             self.assertFalse(main.matches_monitor_config("front", []))
+
+
+class TestMatchesNightAlertSchedule(unittest.TestCase):
+    @staticmethod
+    def _epoch_at(hour, minute):
+        """Build a tz-aware epoch (per main._CACHED_TZ, i.e. TIMEZONE) for a
+        given local hour/minute — never a bare naive datetime.timestamp(),
+        which would silently use the test-runner machine's local timezone."""
+        return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
+
+    def test_camera_not_in_night_alert_cameras_is_always_allowed(self):
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"back_yard"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            # now is clearly outside any night window (midday); unlisted
+            # camera must still be allowed — the feature is a true no-op
+            # for cameras not in NIGHT_ALERT_CAMERAS.
+            now = self._epoch_at(12, 0)
+            self.assertTrue(main.matches_night_alert_schedule("front_door", now))
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+    def test_listed_camera_allowed_inside_window(self):
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            now = self._epoch_at(23, 0)  # inside the 22:00-06:00 window
+            self.assertTrue(main.matches_night_alert_schedule("indoor_hallway", now))
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+    def test_listed_camera_blocked_outside_window(self):
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+            now = self._epoch_at(12, 0)  # outside the 22:00-06:00 window
+            self.assertFalse(main.matches_night_alert_schedule("indoor_hallway", now))
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+    def test_degenerate_equal_start_end_always_false_for_listed_camera(self):
+        """NIGHT_ALERT_START == NIGHT_ALERT_END is a degenerate empty
+        interval and must mean 'never notify' for listed cameras, for any
+        `now` — this is the documented (not just assumed) fallout of
+        in_night_window's half-open-interval semantics."""
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(8, 0)
+            main.NIGHT_ALERT_END = dt_time(8, 0)
+            for hour, minute in [(8, 0), (12, 0), (23, 59), (0, 0)]:
+                now = self._epoch_at(hour, minute)
+                self.assertFalse(main.matches_night_alert_schedule("indoor_hallway", now))
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
 
 
 class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
@@ -1107,6 +1355,51 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
         # if/elif/else into a single ternary.
         backyard_line = next(line for line in text.splitlines() if "Backyard" in line)
         self.assertIn("🟢 Online", backyard_line)
+
+    async def test_cmd_status_displays_night_alert_cameras_when_configured(self):
+        update = MagicMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        update.effective_chat.send_message = AsyncMock()
+        context = MagicMock()
+
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        original_start = main.NIGHT_ALERT_START
+        original_end = main.NIGHT_ALERT_END
+        try:
+            main.NIGHT_ALERT_CAMERAS = {"indoor_hallway"}
+            main.NIGHT_ALERT_START = dt_time(22, 0)
+            main.NIGHT_ALERT_END = dt_time(6, 0)
+
+            await main.cmd_status(update, context)
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+            main.NIGHT_ALERT_START = original_start
+            main.NIGHT_ALERT_END = original_end
+
+        update.effective_chat.send_message.assert_called_once()
+        text = update.effective_chat.send_message.call_args.kwargs.get("text") or update.effective_chat.send_message.call_args.args[0]
+        self.assertIn("Night Alert Cameras", text)
+        self.assertIn("indoor_hallway", text)
+        self.assertIn("22:00", text)
+        self.assertIn("06:00", text)
+
+    async def test_cmd_status_displays_none_configured_when_night_alert_cameras_empty(self):
+        update = MagicMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        update.effective_chat.send_message = AsyncMock()
+        context = MagicMock()
+
+        original_cameras = main.NIGHT_ALERT_CAMERAS
+        try:
+            main.NIGHT_ALERT_CAMERAS = set()
+            await main.cmd_status(update, context)
+        finally:
+            main.NIGHT_ALERT_CAMERAS = original_cameras
+
+        update.effective_chat.send_message.assert_called_once()
+        text = update.effective_chat.send_message.call_args.kwargs.get("text") or update.effective_chat.send_message.call_args.args[0]
+        self.assertIn("Night Alert Cameras", text)
+        self.assertIn("None configured", text)
 
 
 if __name__ == "__main__":
