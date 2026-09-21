@@ -60,12 +60,20 @@ async def run_benchmark():
             "zones": [], "start_time": 1000, "end_time": 1030,
         }
 
+    # No event snapshot/thumbnail/clip available — forces the photo path
+    # down to fetch_camera_snapshot. This call is now unconditional
+    # (fetch_event_media(..., "snapshot") always runs), so it must return a
+    # real value instead of an unawaitable MagicMock.
+    async def mock_fetch_event_media(client, event_id, media_type, max_retries=None):
+        return None
+
     with patch('main.fetch_recording_clip', side_effect=mock_fetch_recording_clip):
         with patch('main.fetch_camera_snapshot', side_effect=mock_fetch_camera_snapshot):
             with patch('main.fetch_event_details', side_effect=mock_fetch_event_details):
-                start_time = time.time()
-                await main.send_grouped_notification(bot, group, http_client)
-                end_time = time.time()
+                with patch('main.fetch_event_media', side_effect=mock_fetch_event_media):
+                    start_time = time.time()
+                    await main.send_grouped_notification(bot, group, http_client)
+                    end_time = time.time()
 
     print(f"Benchmark Results:")
     print(f"Time Taken: {end_time - start_time:.4f} seconds")

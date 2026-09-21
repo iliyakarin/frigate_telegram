@@ -144,6 +144,7 @@ TELEGRAM_TIMEOUT_KWARGS = {
 EVENT_MEDIA_CONFIG = {
     "clip": ("clip.mp4", "video/mp4"),
     "thumbnail": ("thumbnail.jpg", "image/jpeg"),
+    "snapshot": ("snapshot.jpg", "image/jpeg"),
 }
 
 # ─────────────────────────── Logging ─────────────────────────────────
@@ -401,7 +402,7 @@ async def fetch_event_details(client: httpx.AsyncClient, event_id: str) -> dict 
 async def fetch_event_media(
     client: httpx.AsyncClient,
     event_id: str,
-    media_type: Literal["gif", "clip", "thumbnail"],
+    media_type: Literal["gif", "clip", "thumbnail", "snapshot"],
     max_retries: int = MAX_RETRIES,
 ) -> bytes | None:
     """Fetch event-related media (gif, clip, or thumbnail)."""
@@ -789,11 +790,15 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
        zones/sub_label — the review item's own bounds aren't always tight).
     2. Aggregate: union labels/zones/recognized-names, earliest start →
        latest end across all constituent events.
-    3. Always build the clip via fetch_recording_clip over that union
-       window — a real continuous recording, not a per-event preview that
-       may only cover part of the activity.
-    4. Send ONE message: video → photo (snapshot/thumbnail fallback) →
-       text-only, same fallback shape as before.
+    3. Build the clip via fetch_recording_clip over that union window — a
+       real continuous recording, not a per-event preview that may only
+       cover part of the activity. Falls back to the pre-generated event
+       clip if the recording endpoint has nothing yet.
+    4. Photo fallback is event-anchored: event snapshot.jpg → event
+       thumbnail.jpg → live camera frame (last resort — by send time the
+       subject may already have left the live frame).
+    5. Send ONE message: video → photo → text-only, same fallback shape
+       as before.
     """
     details_list = await asyncio.gather(
         *[fetch_event_details(http_client, event_id) for event_id in group.event_ids]
@@ -838,12 +843,26 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
     # as a video thumbnail or as the fallback photo, so it never needs to
     # wait on the clip fetch to start. Removes serial latency only; what's
     # fetched and how it's used below is unchanged.
+    #
+    # Photo priority is event-anchored, not live: fetch_camera_snapshot()
+    # hits the camera's *current* live frame, which by send time is 45s+
+    # after the event ended (grouping delay) — the subject is long gone.
+    # The event's own snapshot.jpg (Frigate's best captured frame of the
+    # event) is tried first, then the event thumbnail, and only then the
+    # live camera frame as a last resort.
     clip_data, photo_data = await asyncio.gather(
         fetch_recording_clip(http_client, group.camera, padded_start, padded_end),
-        fetch_camera_snapshot(http_client, group.camera),
+        fetch_event_media(http_client, primary_event_id, "snapshot"),
     )
+    if not clip_data:
+        # Recording-based fetch failed (not-yet-flushed segment, retention
+        # gap) — fall back to Frigate's own pre-generated event clip before
+        # giving up to a photo.
+        clip_data = await fetch_event_media(http_client, primary_event_id, "clip")
     if not photo_data:
         photo_data = await fetch_event_media(http_client, primary_event_id, "thumbnail")
+    if not photo_data:
+        photo_data = await fetch_camera_snapshot(http_client, group.camera)
 
     # If the combined clip exceeds Telegram's limit (50MB), split into two parts
     clips_to_send: list[tuple[bytes, str]] = []
