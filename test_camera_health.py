@@ -280,6 +280,31 @@ def test_evaluate_stats_handles_null_camera_entry_without_raising():
     assert monitor.states["cam2"].current_fps == 0.0
 
 
+def test_evaluate_stats_handles_null_uptime_without_raising():
+    """Regression: `"uptime": null` (key present but null, container itself
+    non-null) must not raise on the `uptime < 60` comparison."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {"service": {"uptime": None}, "cameras": {}}
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    assert alerts == []
+
+
+def test_evaluate_stats_handles_null_camera_fps_without_raising():
+    """Regression: a camera's `camera_fps`/`expected_fps` present but null
+    (plausible mid-reconnect) must not raise on `float(None)`."""
+    monitor = CameraHealthMonitor(debounce_seconds=60)
+    stats = {
+        "service": {"uptime": 120},
+        "cameras": {
+            "cam1": {"camera_fps": None, "expected_fps": None, "connection_quality": "unusable"},
+        },
+    }
+    alerts = monitor.evaluate_stats(stats, now=1000.0)
+    # First pass is pending debounce, so no alert is due yet either way.
+    assert alerts == []
+    assert monitor.states["cam1"].current_fps == 0.0
+
+
 @pytest.mark.asyncio
 async def test_fetch_log_error_detail_success():
     import httpx

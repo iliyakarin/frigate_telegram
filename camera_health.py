@@ -309,7 +309,8 @@ class CameraHealthMonitor:
         # own startup/restart), which `.get` would pass straight through.
         # `or {}` normalizes both "missing" and "present but None" the same way.
         service = stats_data.get("service") or {}
-        uptime = service.get("uptime", 0)
+        # `or 0` also covers "key present but None" — same rationale as above.
+        uptime = service.get("uptime") or 0
         # Skip checks during Frigate startup grace period (< 60s)
         if uptime < 60:
             return []
@@ -322,8 +323,8 @@ class CameraHealthMonitor:
                 continue
 
             data = data or {}
-            current_fps = float(data.get("camera_fps", 0.0))
-            expected_fps = float(data.get("expected_fps", 5.0))
+            current_fps = float(data.get("camera_fps") or 0.0)
+            expected_fps = float(data.get("expected_fps") or 5.0)
             connection_quality = str(data.get("connection_quality", "")).lower()
 
             # Flagged as failing if fps < 0.1 or connection unusable

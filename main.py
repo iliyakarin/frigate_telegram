@@ -1392,11 +1392,21 @@ async def check_camera_health_and_alert(
         now = time.time()
 
     try:
-        resp = await client.get(f"{FRIGATE_URL}/api/stats", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
-        if resp.status_code != 200:
-            logger.debug("Frigate /api/stats returned HTTP %s", resp.status_code)
+        # Fetching stats is expected to fail routinely during ordinary Frigate
+        # downtime/restarts — logged at `debug` (matches the rest of this
+        # file's convention for transient connectivity, e.g. the polling
+        # loop's back-off retry log). The outer `except` below is reserved for
+        # genuine bugs (bad payload shape, alert-dispatch errors) and stays at
+        # `error`.
+        try:
+            resp = await client.get(f"{FRIGATE_URL}/api/stats", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
+            if resp.status_code != 200:
+                logger.debug("Frigate /api/stats returned HTTP %s", resp.status_code)
+                return
+            stats_data = resp.json()
+        except Exception as exc:
+            logger.debug("Failed to fetch Frigate stats for health check: %s", exc)
             return
-        stats_data = resp.json()
 
         alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
         for alert in alerts:
