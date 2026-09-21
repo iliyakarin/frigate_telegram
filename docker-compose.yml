@@ -41,6 +41,11 @@ services:
       # Comma-separated or JSON list of cameras to monitor. Omit to monitor all cameras.
       # - HEALTH_MONITOR_CAMERAS=front_door,back_camera
 
+      # Night-Only Alerts (suppress notifications outside configured window)
+      # - NIGHT_ALERT_CAMERAS=Kitchen,LivingRoom
+      # - NIGHT_ALERT_START=23:00                         # HH:MM (default: 22:00)
+      # - NIGHT_ALERT_END=06:30                           # HH:MM (default: 06:00)
+
 
       # ── Optional ──────────────────────────────────────────────
       - EXTERNAL_URL=https://cctv.example.com            # Public Frigate URL via Cloudflare Tunnel (for event links)
