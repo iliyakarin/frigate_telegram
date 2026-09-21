@@ -724,6 +724,20 @@ def format_grouped_caption(data: dict) -> str:
 # ─────────────────────── Telegram Notification ───────────────────────
 
 
+async def _send_fallback_photo(bot: Bot, photo_data: bytes, caption: str) -> None:
+    """Shared send_photo call shape for send_grouped_notification's two
+    photo-fallback branches (clip missing/too-large, and send_video raised).
+    A failure here propagates to the caller — it is not swallowed here."""
+    await bot.send_photo(
+        chat_id=TELEGRAM_CHAT_ID,
+        photo=photo_data,
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+        filename="snapshot.jpg",
+        **TELEGRAM_TIMEOUT_KWARGS,
+    )
+
+
 async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: httpx.AsyncClient) -> None:
     """Send a **single** consolidated Telegram message for a notification group.
 
@@ -778,9 +792,14 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
 
     padded_start = max(0, int(union_start) - CLIP_PADDING_SECONDS)
     padded_end = int(union_end) + CLIP_PADDING_SECONDS
-    clip_data = await fetch_recording_clip(http_client, group.camera, padded_start, padded_end)
-
-    photo_data = await fetch_camera_snapshot(http_client, group.camera)
+    # Fetch the clip and snapshot concurrently — the snapshot is only used
+    # as a video thumbnail or as the fallback photo, so it never needs to
+    # wait on the clip fetch to start. Removes serial latency only; what's
+    # fetched and how it's used below is unchanged.
+    clip_data, photo_data = await asyncio.gather(
+        fetch_recording_clip(http_client, group.camera, padded_start, padded_end),
+        fetch_camera_snapshot(http_client, group.camera),
+    )
     if not photo_data:
         photo_data = await fetch_event_media(http_client, primary_event_id, "thumbnail")
 
@@ -805,8 +824,13 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
                 if clip2 and len(clip2) <= MAX_TELEGRAM_FILE_SIZE:
                     clips_to_send.append((clip2, f"{caption}\n\n📹 <i>(Part 2/2)</i>"))
 
-    try:
-        if clips_to_send:
+    if clips_to_send:
+        # Narrowly scoped to the send_video call(s) only — a failure here is
+        # the one case with a real fallback story (photo/text instead of
+        # video). photo_data/text failures below propagate normally instead
+        # of being caught here, so they're never mistaken for a video
+        # failure and never double-sent (see _send_fallback_photo callers).
+        try:
             for i, (video_bytes, cap) in enumerate(clips_to_send):
                 await bot.send_video(
                     chat_id=TELEGRAM_CHAT_ID,
@@ -822,49 +846,36 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
                 "Group on %s (%d event(s)) → sent %d video clip(s) with caption ✓",
                 group.camera, len(group.event_ids), len(clips_to_send),
             )
+        except Exception as exc:
+            logger.error("Failed to send Telegram video notification for group on %s: %s", group.camera, exc)
+            try:
+                if photo_data:
+                    await _send_fallback_photo(
+                        bot, photo_data, f"{caption}\n\n⚠️ <i>(Video upload failed, sent snapshot)</i>"
+                    )
+                    logger.info("Group on %s → fallback photo sent successfully ✓", group.camera)
+                else:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=f"{caption}\n\n⚠️ <i>(Video upload failed)</i>",
+                        parse_mode=ParseMode.HTML,
+                        **TELEGRAM_TIMEOUT_KWARGS,
+                    )
+            except Exception as fallback_exc:
+                logger.error("Fallback notification also failed for group on %s: %s", group.camera, fallback_exc)
 
-        elif photo_data:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=photo_data,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                filename="snapshot.jpg",
-                **TELEGRAM_TIMEOUT_KWARGS,
-            )
-            logger.info("Group on %s → sent photo with caption (clip unavailable or exceeds size limit)", group.camera)
+    elif photo_data:
+        await _send_fallback_photo(bot, photo_data, caption)
+        logger.info("Group on %s → sent photo with caption (clip unavailable or exceeds size limit)", group.camera)
 
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=caption,
-                parse_mode=ParseMode.HTML,
-                **TELEGRAM_TIMEOUT_KWARGS,
-            )
-            logger.info("Group on %s → sent text only (no media available)", group.camera)
-
-    except Exception as exc:
-        logger.error("Failed to send Telegram video notification for group on %s: %s", group.camera, exc)
-        try:
-            if photo_data:
-                await bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=photo_data,
-                    caption=f"{caption}\n\n⚠️ <i>(Video upload failed, sent snapshot)</i>",
-                    parse_mode=ParseMode.HTML,
-                    filename="snapshot.jpg",
-                    **TELEGRAM_TIMEOUT_KWARGS,
-                )
-                logger.info("Group on %s → fallback photo sent successfully ✓", group.camera)
-            else:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=f"{caption}\n\n⚠️ <i>(Video upload failed)</i>",
-                    parse_mode=ParseMode.HTML,
-                    **TELEGRAM_TIMEOUT_KWARGS,
-                )
-        except Exception as fallback_exc:
-            logger.error("Fallback notification also failed for group on %s: %s", group.camera, fallback_exc)
+    else:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            **TELEGRAM_TIMEOUT_KWARGS,
+        )
+        logger.info("Group on %s → sent text only (no media available)", group.camera)
 
 
 # ─────────────────── Telegram Command Handlers ───────────────────────
@@ -990,12 +1001,7 @@ async def cmd_cameras(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines = ["<b>Registered Cameras:</b>", ""]
     for cam in cameras:
         cstate = camera_health_monitor.states.get(cam)
-        if cstate and cstate.is_offline:
-            indicator = "🔴 Offline"
-        elif cstate:
-            indicator = "🟢 Online"
-        else:
-            indicator = "🟢 Online"
+        indicator = "🔴 Offline" if (cstate and cstate.is_offline) else "🟢 Online"
         lines.append(f"• <code>{html.escape(cam)}</code>: {indicator}")
 
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -1375,56 +1381,53 @@ async def check_camera_health_and_alert(
     client: httpx.AsyncClient,
     now: float | None = None,
 ) -> None:
-    """Evaluate Frigate camera stats and dispatch Telegram alerts on failures or recoveries."""
+    """Evaluate Frigate camera stats and dispatch Telegram alerts on failures or recoveries.
+
+    Guarded end-to-end: this function must always return normally, no matter
+    what fails inside it (bad Frigate payload, network error, alert-send
+    failure). _polling_tick relies on that — a health-check exception must
+    never abort a tick's notification processing.
+    """
     if now is None:
         now = time.time()
 
     try:
-        req = client.get(f"{FRIGATE_URL}/api/stats", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
-        if asyncio.iscoroutine(req) or hasattr(req, "__await__"):
-            resp = await req
-        else:
-            return
+        resp = await client.get(f"{FRIGATE_URL}/api/stats", auth=_http_auth(), timeout=FRIGATE_TIMEOUT)
         if resp.status_code != 200:
             logger.debug("Frigate /api/stats returned HTTP %s", resp.status_code)
             return
         stats_data = resp.json()
-    except Exception as exc:
-        logger.debug("Failed to fetch Frigate stats for health check: %s", exc)
-        return
 
-    alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
-    for alert in alerts:
-        if alert.alert_type == "offline":
+        alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
+        for alert in alerts:
+            if alert.alert_type == "offline":
+                try:
+                    detail = await fetch_log_error_detail(client, FRIGATE_URL, alert.camera, auth=_http_auth())
+                    if detail:
+                        cstate = camera_health_monitor.states.get(alert.camera)
+                        if cstate:
+                            cstate.last_error_detail = detail
+                            alert.message = camera_health_monitor.format_offline_alert(
+                                camera=alert.camera,
+                                current_fps=cstate.current_fps,
+                                expected_fps=cstate.expected_fps,
+                                alert_count=alert.alert_count,
+                                error_detail=detail,
+                            )
+                except Exception as exc:
+                    logger.debug("Failed to fetch log error detail for %s: %s", alert.camera, exc)
+
             try:
-                log_req = fetch_log_error_detail(client, FRIGATE_URL, alert.camera, auth=_http_auth())
-                if asyncio.iscoroutine(log_req) or hasattr(log_req, "__await__"):
-                    detail = await log_req
-                else:
-                    detail = None
-                if detail:
-                    cstate = camera_health_monitor.states.get(alert.camera)
-                    if cstate:
-                        cstate.last_error_detail = detail
-                        alert.message = camera_health_monitor.format_offline_alert(
-                            camera=alert.camera,
-                            current_fps=cstate.current_fps,
-                            expected_fps=cstate.expected_fps,
-                            alert_count=alert.alert_count,
-                            error_detail=detail,
-                        )
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=alert.message,
+                    parse_mode=ParseMode.HTML,
+                    **TELEGRAM_TIMEOUT_KWARGS,
+                )
             except Exception as exc:
-                logger.debug("Failed to fetch log error detail for %s: %s", alert.camera, exc)
-
-        try:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=alert.message,
-                parse_mode=ParseMode.HTML,
-                **TELEGRAM_TIMEOUT_KWARGS,
-            )
-        except Exception as exc:
-            logger.error("Failed to send camera health alert for %s: %s", alert.camera, exc)
+                logger.error("Failed to send camera health alert for %s: %s", alert.camera, exc)
+    except Exception as exc:
+        logger.error("Camera health check failed: %s", exc)
 
 
 async def _polling_tick(
@@ -1433,43 +1436,56 @@ async def _polling_tick(
     pending: dict[str, PendingGroup],
     last_poll_ts: float,
     now: float | None = None,
+    notifications_enabled: bool = True,
 ) -> float:
     """Run one polling iteration: fetch new review items, merge them into
     pending groups, finalize+send any that have gone quiet, and return the
     new last_poll_ts. Extracted from polling_loop so the hold→merge→send
     flow can be unit tested across multiple ticks without an infinite loop.
+
+    The camera-health check runs in a `finally` block so it always fires
+    exactly once per tick — regardless of whether notification processing
+    below raises, and regardless of *notifications_enabled* — decoupling
+    health alerts from both crashes in the notification path and from
+    /disable. When notifications are disabled, *last_poll_ts* is left
+    unchanged (not advanced), so re-enabling still picks up everything
+    missed since the last successful poll.
     """
     if now is None:
         now = time.time()
 
-    # Check camera health and dispatch alerts if due
-    await check_camera_health_and_alert(bot, http_client, now=now)
+    new_last_poll_ts = last_poll_ts
+    try:
+        if notifications_enabled:
+            reviews = await fetch_review_items(http_client, last_poll_ts)
+            new_last_poll_ts = time.time()
 
-    reviews = await fetch_review_items(http_client, last_poll_ts)
-    new_last_poll_ts = time.time()
+            matched = [
+                r for r in reviews
+                if matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
+            ]
+            for review in matched:
+                merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
 
-    matched = [
-        r for r in reviews
-        if matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
-    ]
-    for review in matched:
-        merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
+            ready = split_ready_groups(pending, now, EVENT_MERGE_GAP, MAX_EVENT_SPAN)
+            ready.sort(key=lambda g: g.first_start)
 
-    ready = split_ready_groups(pending, now, EVENT_MERGE_GAP, MAX_EVENT_SPAN)
-    ready.sort(key=lambda g: g.first_start)
+            if matched or ready:
+                logger.info(
+                    "Processing %d new review item(s), %d group(s) ready to send",
+                    len(matched), len(ready),
+                )
 
-    if matched or ready:
-        logger.info(
-            "Processing %d new review item(s), %d group(s) ready to send",
-            len(matched), len(ready),
-        )
-
-    # Sequential, not gather: keeps the chat feed in chronological order.
-    for group in ready:
-        try:
-            await send_grouped_notification(bot, group, http_client)
-        except Exception as e:
-            logger.error("Fatal error processing notification group: %s", e)
+            # Sequential, not gather: keeps the chat feed in chronological order.
+            for group in ready:
+                try:
+                    await send_grouped_notification(bot, group, http_client)
+                except Exception as e:
+                    logger.error("Fatal error processing notification group: %s", e)
+    finally:
+        # Always runs — see docstring. check_camera_health_and_alert is
+        # itself guarded end-to-end, so this can never raise.
+        await check_camera_health_and_alert(bot, http_client, now=now)
 
     return new_last_poll_ts
 
@@ -1492,31 +1508,35 @@ async def polling_loop(bot: Bot, http_client: httpx.AsyncClient) -> None:
 
     while True:
         try:
-            if state.enabled:
-                try:
-                    last_poll_ts = await _polling_tick(bot, http_client, pending, last_poll_ts)
+            notifications_enabled = state.enabled
+            if not notifications_enabled:
+                logger.debug("Notifications disabled — health check only this tick.")
+                current_interval = POLLING_INTERVAL  # Reset interval while disabled
 
-                    # Recovery logic
-                    if not frigate_online:
-                        logger.info("Frigate is back online! Resuming normal polling.")
-                        frigate_online = True
-                        current_interval = POLLING_INTERVAL
+            try:
+                # Always runs — camera-health alerts must not depend on
+                # notifications being enabled (see _polling_tick docstring).
+                last_poll_ts = await _polling_tick(
+                    bot, http_client, pending, last_poll_ts, notifications_enabled=notifications_enabled
+                )
 
-                except (httpx.NetworkError, httpx.TimeoutException) as exc:
-                    if frigate_online:
-                        logger.error("Frigate connection lost: %s. Entering back-off mode.", exc)
-                        frigate_online = False
+                # Recovery logic
+                if notifications_enabled and not frigate_online:
+                    logger.info("Frigate is back online! Resuming normal polling.")
+                    frigate_online = True
+                    current_interval = POLLING_INTERVAL
 
-                    # Simple linear back-off: increase interval but stay responsive
-                    current_interval = min(current_interval + 60, 300)
-                    logger.debug("Frigate unreachable, retrying in %ds", current_interval)
+            except (httpx.NetworkError, httpx.TimeoutException) as exc:
+                if frigate_online:
+                    logger.error("Frigate connection lost: %s. Entering back-off mode.", exc)
+                    frigate_online = False
 
-                except Exception as exc:
-                    logger.error("Unexpected error in polling loop: %s", exc, exc_info=DEBUG)
-            else:
-                logger.debug("Notifications disabled — skipping poll.")
-                current_interval = POLLING_INTERVAL # Reset interval while disabled
-                last_poll_ts = time.time()
+                # Simple linear back-off: increase interval but stay responsive
+                current_interval = min(current_interval + 60, 300)
+                logger.debug("Frigate unreachable, retrying in %ds", current_interval)
+
+            except Exception as exc:
+                logger.error("Unexpected error in polling loop: %s", exc, exc_info=DEBUG)
         except Exception as exc:
             logger.error("Critical failure in polling loop: %s", exc, exc_info=DEBUG)
 

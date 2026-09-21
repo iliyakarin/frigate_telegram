@@ -174,6 +174,7 @@ The bot continuously monitors camera connection quality and frame rates via Frig
 - **Dual-Check Error Details:** When an alert is triggered, the bot inspects Frigate's `/api/logs/frigate` to extract relevant ffmpeg/demuxing errors. If log access is unavailable, it falls back cleanly to stats data.
 - **Recovery Notification:** When a camera reconnects and begins receiving frames again, the bot sends a recovery alert with the total downtime duration and resets all counters.
 - **Configurable Scope:** By default, all cameras reported by Frigate are monitored. Use `HEALTH_MONITOR_CAMERAS` to limit monitoring to specific cameras.
+- **Independent of `/disable`:** Camera health alerts keep running even while event notifications are turned off via `/disable` — the two are checked independently every polling cycle.
 
 ## 🤖 Telegram Commands
 

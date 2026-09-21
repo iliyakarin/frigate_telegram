@@ -304,18 +304,24 @@ class CameraHealthMonitor:
         if now is None:
             now = time.time()
 
-        uptime = stats_data.get("service", {}).get("uptime", 0)
+        # `.get(key, default)` only covers a *missing* key — Frigate can
+        # plausibly return a key present with value `None` (e.g. during its
+        # own startup/restart), which `.get` would pass straight through.
+        # `or {}` normalizes both "missing" and "present but None" the same way.
+        service = stats_data.get("service") or {}
+        uptime = service.get("uptime", 0)
         # Skip checks during Frigate startup grace period (< 60s)
         if uptime < 60:
             return []
 
-        cameras_stats = stats_data.get("cameras", {})
+        cameras_stats = stats_data.get("cameras") or {}
         alerts: list[HealthAlert] = []
 
         for camera, data in cameras_stats.items():
             if not self.should_monitor(camera):
                 continue
 
+            data = data or {}
             current_fps = float(data.get("camera_fps", 0.0))
             expected_fps = float(data.get("expected_fps", 5.0))
             connection_quality = str(data.get("connection_quality", "")).lower()
