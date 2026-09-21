@@ -1033,6 +1033,13 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
             now = self._epoch_at(23, 0)  # inside the 22:00-06:00 window
+            # Anchor the review's start/end to `now` (a real tz-aware 2024
+            # epoch) rather than the tiny 100/110 placeholders used
+            # elsewhere in this file — otherwise (now - first_start) would
+            # already exceed MAX_EVENT_SPAN and the group would finalize
+            # immediately instead of staying held pending.
+            review["start_time"] = now - 5
+            review["end_time"] = now
 
             with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
                 pending = {}
@@ -1077,6 +1084,11 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
             main.NIGHT_ALERT_START = dt_time(22, 0)
             main.NIGHT_ALERT_END = dt_time(6, 0)
             now = self._epoch_at(12, 0)  # outside indoor_hallway's window
+            # See comment in test_polling_tick_allows_night_alert_camera_inside_window:
+            # anchor start/end to `now` so the group doesn't instantly exceed
+            # MAX_EVENT_SPAN and finalize before this assertion runs.
+            review["start_time"] = now - 5
+            review["end_time"] = now
 
             with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
                 pending = {}

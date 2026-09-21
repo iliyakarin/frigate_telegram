@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Literal
@@ -72,6 +72,15 @@ def get_bool_setting(key: str, default: bool) -> bool:
     return val.lower() in ("true", "1", "yes", "on")
 
 
+def parse_hhmm(raw: str, default: str) -> dt_time:
+    """Parse an 'HH:MM' string into a time object, falling back to *default* on invalid input."""
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M").time()
+    except (ValueError, AttributeError):
+        logger.warning("Invalid HH:MM value '%s'; using default: %s", raw, default)
+        return datetime.strptime(default, "%H:%M").time()
+
+
 def mask_url(url: str) -> str:
     """Mask a URL to show only the scheme and host, removing credentials and path."""
     if not url:
@@ -92,6 +101,10 @@ MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
 HEALTH_MONITOR_CAMERAS_RAW = os.environ.get("HEALTH_MONITOR_CAMERAS", "")
 HEALTH_MONITOR_CAMERAS = parse_monitored_cameras(HEALTH_MONITOR_CAMERAS_RAW)
 camera_health_monitor = CameraHealthMonitor(monitored_cameras=HEALTH_MONITOR_CAMERAS, debounce_seconds=60)
+
+# Night-only alerts: cameras in this set only notify inside the configured window.
+# Empty set (unset/empty env var) means the feature is off — no camera is restricted.
+NIGHT_ALERT_CAMERAS = set(parse_monitored_cameras(os.environ.get("NIGHT_ALERT_CAMERAS", "")) or [])
 
 POLLING_INTERVAL = get_int_setting("POLLING_INTERVAL", 60)
 
@@ -185,6 +198,9 @@ def parse_monitor_config(raw: str) -> dict[str, set[str]]:
 
 
 MONITOR_CONFIG = parse_monitor_config(MONITOR_CONFIG_RAW)
+
+NIGHT_ALERT_START = parse_hhmm(os.environ.get("NIGHT_ALERT_START", "22:00"), "22:00")
+NIGHT_ALERT_END = parse_hhmm(os.environ.get("NIGHT_ALERT_END", "06:00"), "06:00")
 
 # ─────────────────────── Notification State ──────────────────────────
 
@@ -572,6 +588,32 @@ def matches_monitor_config(camera: str, zones: list[str]) -> bool:
     return not allowed_zones.isdisjoint(zones)
 
 
+def in_night_window(now_local: dt_time, start: dt_time, end: dt_time) -> bool:
+    """True if now_local falls in [start, end). Handles windows that cross midnight
+    (e.g. start=22:00, end=06:00) as well as normal same-day windows.
+
+    NIGHT_ALERT_START == NIGHT_ALERT_END is a degenerate empty interval and means
+    "never notify" for listed cameras (start <= now_local < end is never true when
+    start == end). This is intentional fallout of the interval semantics, not a bug
+    to special-case — a misconfigured equal start/end is effectively "always off",
+    which is an acceptable (if unhelpful) result for a user config mistake."""
+    if start <= end:
+        return start <= now_local < end
+    return now_local >= start or now_local < end
+
+
+def matches_night_alert_schedule(camera: str, now: float) -> bool:
+    """Check whether *camera* is allowed to notify at epoch *now*.
+
+    Cameras outside NIGHT_ALERT_CAMERAS are unaffected (always True). Cameras in
+    the list only pass while local time (TIMEZONE) is inside the configured window.
+    """
+    if camera not in NIGHT_ALERT_CAMERAS:
+        return True
+    now_local = datetime.fromtimestamp(now, tz=_CACHED_TZ).time()
+    return in_night_window(now_local, NIGHT_ALERT_START, NIGHT_ALERT_END)
+
+
 # ─────────────────────── Caption Formatting ──────────────────────────
 
 
@@ -956,6 +998,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status_text = "Enabled" if state.enabled else "Disabled"
     cameras = ", ".join(MONITOR_CONFIG.keys()) if MONITOR_CONFIG else "All Cameras"
     health_cams = ", ".join(HEALTH_MONITOR_CAMERAS) if HEALTH_MONITOR_CAMERAS else "All Cameras"
+    night_cams = ", ".join(sorted(NIGHT_ALERT_CAMERAS)) if NIGHT_ALERT_CAMERAS else "None configured"
 
     health_lines = []
     if camera_health_monitor.states:
@@ -973,6 +1016,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>Polling Interval:</b> ⏱ {POLLING_INTERVAL}s",
         f"<b>Monitored Cameras:</b> 🎥 {html.escape(cameras)}",
         f"<b>Health Monitored:</b> 🩺 {html.escape(health_cams)}",
+        f"<b>Night Alert Cameras:</b> 🌙 {html.escape(night_cams)} ({NIGHT_ALERT_START.strftime('%H:%M')}–{NIGHT_ALERT_END.strftime('%H:%M')})",
     ]
     if health_lines:
         lines.append("")
@@ -1473,6 +1517,7 @@ async def _polling_tick(
             matched = [
                 r for r in reviews
                 if matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
+                and matches_night_alert_schedule(r.get("camera", ""), now)
             ]
             for review in matched:
                 merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
