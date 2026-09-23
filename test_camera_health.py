@@ -394,7 +394,7 @@ CACHE_KEY = "/tmp/cache"
 
 
 def _cache_monitor():
-    return camera_health.CacheStorageMonitor(monitored_cameras=None, debounce_seconds=60)
+    return camera_health.CacheStorageMonitor(debounce_seconds=60)
 
 
 def _cache_stats(used, total=2048.0, uptime=120):

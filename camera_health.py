@@ -420,8 +420,8 @@ class CacheStorageMonitor(CameraHealthMonitor):
     overridden to render storage text from the last observed reading.
     """
 
-    def __init__(self, monitored_cameras: list[str] | None = None, debounce_seconds: float = 60.0) -> None:
-        super().__init__(monitored_cameras=monitored_cameras, debounce_seconds=debounce_seconds)
+    def __init__(self, debounce_seconds: float = 60.0) -> None:
+        super().__init__(monitored_cameras=None, debounce_seconds=debounce_seconds)
         # Last reading (MiB / percent), None when unavailable. Read by /status.
         self.last_pct: float | None = None
         self.last_used: float | None = None
@@ -479,8 +479,8 @@ class CacheStorageMonitor(CameraHealthMonitor):
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return (
             f"🚨 <b>Frigate recording cache almost full</b>\n\n"
-            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct or 0:.0f}% "
-            f"({self.last_used or 0:.0f}/{self.last_total or 0:.0f} MiB)\n"
+            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct:.0f}% "
+            f"({self.last_used:.0f}/{self.last_total:.0f} MiB)\n"
             f"Recordings are likely not being saved (clips will be missing). "
             f"Restart Frigate: <code>docker compose restart frigate</code>\n"
             f"<b>Alert:</b> {alert_count}/{MAX_HEALTH_ALERTS}\n"
@@ -499,7 +499,7 @@ class CacheStorageMonitor(CameraHealthMonitor):
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return (
             f"✅ <b>Frigate recording cache recovered</b>\n\n"
-            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct or 0:.0f}%\n"
+            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct:.0f}%\n"
             f"<b>Duration:</b> {format_downtime(downtime_seconds)}\n"
             f"<b>Time:</b> {timestamp_str}"
         )

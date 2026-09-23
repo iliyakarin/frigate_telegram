@@ -107,7 +107,7 @@ camera_health_monitor = CameraHealthMonitor(monitored_cameras=HEALTH_MONITOR_CAM
 # Alert when Frigate's /tmp/cache usage >= this % (clamped to 1..100): a full
 # cache means the recording maintainer stalled and recordings aren't saved.
 HEALTH_CACHE_THRESHOLD_PCT = min(100, max(1, get_int_setting("HEALTH_CACHE_THRESHOLD_PCT", 85)))
-cache_health_monitor = CacheStorageMonitor(monitored_cameras=None, debounce_seconds=60)
+cache_health_monitor = CacheStorageMonitor(debounce_seconds=60)
 
 # Night-only alerts: cameras in this set only notify inside the configured window.
 # Empty set (unset/empty env var) means the feature is off — no camera is restricted.
@@ -1636,7 +1636,7 @@ async def check_camera_health_and_alert(
             if cache_alert is not None:
                 await _send_health_alert(bot, cache_alert)
         except Exception as exc:
-            logger.error("Frigate cache health check failed: %s", exc)
+            logger.error("Frigate cache health check failed: %s", exc, exc_info=True)
 
         alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
         for alert in alerts:
