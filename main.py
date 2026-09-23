@@ -974,8 +974,9 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
             logger.info("Event %s on %s: sending only the first %d of %d parts", eid, group.camera, MAX_CLIP_PARTS, n)
         # Fetched sequentially, not gathered: each Frigate clip request spawns
         # its own ffmpeg writing into /tmp/cache. Single attempt per part (the
-        # recording evidently exists), so worst case the polling tick stalls for
-        # MAX_CLIP_PARTS x (FRIGATE_TIMEOUT + UPLOAD_TIMEOUT).
+        # recording evidently exists), so the polling tick stalls ~MAX_CLIP_PARTS x
+        # (FRIGATE_TIMEOUT + UPLOAD_TIMEOUT) per event when requests time out, more
+        # if they trickle (both timeouts are per-operation, not total deadlines).
         # ponytail: all kept parts are buffered before sending (~full clip size,
         # capped at MAX_CLIP_PARTS x 50 MB per event); stream part-by-part if RAM bites.
         parts: list[tuple[bytes, str]] = []

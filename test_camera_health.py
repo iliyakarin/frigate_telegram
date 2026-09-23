@@ -532,6 +532,13 @@ def test_cache_uptime_grace_skips_state_but_records_pct(uptime):
     assert monitor.last_pct == pytest.approx(2000.0 / 2048.0 * 100)
 
 
+def test_cache_non_numeric_uptime_logs_warning(caplog):
+    monitor = _cache_monitor()
+    with caplog.at_level("WARNING", logger="camera_health"):
+        assert monitor.evaluate(_cache_stats(2000.0, uptime="abc"), 85, now=1000.0) is None
+    assert "non-numeric uptime" in caplog.text
+
+
 def _drop(path):
     """Build a malformed payload by mutating a fresh full-cache payload."""
     def build():

@@ -457,6 +457,9 @@ class CacheStorageMonitor(CameraHealthMonitor):
 
         # Same startup grace as camera checks: /status still gets the reading.
         uptime = service.get("uptime")
+        if uptime is not None and not _is_number(uptime):
+            # Don't let a Frigate payload change disable the alert silently.
+            logger.warning("Frigate stats has non-numeric uptime %r; cache alert skipped", uptime)
         if not _is_number(uptime) or uptime < 60:
             return None
 
