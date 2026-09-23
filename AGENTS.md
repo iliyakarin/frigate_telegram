@@ -28,16 +28,15 @@ This document defines the strict engineering, testing, and deployment rules for 
 - **Mandatory Coverage**: Every new feature, bug fix, or behavioral change must be accompanied by comprehensive unit tests.
 - **Test Suites**:
   - `test_main.py` — Core application, API polling, notifications, command handlers.
+  - `test_camera_health.py` — Camera health and Frigate cache-storage monitoring/alerts.
   - `test_grouping.py` — Event grouping and debounce window logic.
   - `test_security.py` — Authorization and access control.
   - `test_state.py` — Persistent notification state management.
   - `test_utils.py` — Helper functions and formatting.
 - **Verification Command**:
-  Always verify the entire test suite passes before committing:
+  Always verify the entire test suite passes before committing (same command CI runs; needs `pytest` and `pytest-asyncio`, which are not in `requirements.txt`):
   ```bash
   python3 -m pytest
-  # or
-  python3 test_main.py
   ```
 
 ---
