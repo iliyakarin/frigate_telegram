@@ -973,11 +973,14 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         if n > MAX_CLIP_PARTS:
             logger.info("Event %s on %s: sending only the first %d of %d parts", eid, group.camera, MAX_CLIP_PARTS, n)
         # Fetched sequentially, not gathered: each Frigate clip request spawns
-        # its own ffmpeg writing into /tmp/cache. Worst case this adds up to
-        # MAX_CLIP_PARTS sequential fetches (+ uploads) inside the polling tick.
+        # its own ffmpeg writing into /tmp/cache. Single attempt per part (the
+        # recording evidently exists), so worst case the polling tick stalls for
+        # MAX_CLIP_PARTS x (FRIGATE_TIMEOUT + UPLOAD_TIMEOUT).
+        # ponytail: all kept parts are buffered before sending (~full clip size,
+        # capped at MAX_CLIP_PARTS x 50 MB per event); stream part-by-part if RAM bites.
         parts: list[tuple[bytes, str]] = []
         for part_idx, (w_start, w_end) in enumerate(to_fetch, start=1):
-            part = await fetch_recording_clip(http_client, group.camera, w_start, w_end)
+            part = await fetch_recording_clip(http_client, group.camera, w_start, w_end, max_retries=1)
             if not part or len(part) > MAX_TELEGRAM_FILE_SIZE:
                 logger.warning(
                     "Event %s on %s: part %d/%d (%d bytes) missing or still over the size limit; skipping",
@@ -1176,6 +1179,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 health_lines.append(f"• <code>{html.escape(cam)}</code>: 🔴 Offline ({cstate.current_fps:.1f} fps) - Down for {downtime}")
             else:
                 health_lines.append(f"• <code>{html.escape(cam)}</code>: 🟢 Online ({cstate.current_fps:.1f} fps)")
+    cache_pct = cache_health_monitor.last_pct
+    if cache_pct is not None:
+        cache_emoji = "🔴" if cache_pct >= HEALTH_CACHE_THRESHOLD_PCT else "🟢"
+        health_lines.append(f"• 💾 <b>Frigate cache:</b> {cache_emoji} {cache_pct:.0f}%")
 
     lines = [
         "📊 <b>Bot Status</b>",
@@ -1190,11 +1197,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("")
         lines.append("📹 <b>Camera Health:</b>")
         lines.extend(health_lines)
-    cache_pct = cache_health_monitor.last_pct
-    if cache_pct is not None:
-        cache_emoji = "🔴" if cache_pct >= HEALTH_CACHE_THRESHOLD_PCT else "🟢"
-        lines.append(f"💾 <b>Frigate cache:</b> {cache_emoji} {cache_pct:.0f}%")
-
     lines.extend([
         "",
         "🛠 <b>Configuration</b>",

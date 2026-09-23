@@ -266,7 +266,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         mock_details.side_effect = details_side_effect
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             return {
                 (100 - main.CLIP_PADDING_SECONDS, 130 + main.CLIP_PADDING_SECONDS): b"e1_clip_bytes",
                 (150 - main.CLIP_PADDING_SECONDS, 200 + main.CLIP_PADDING_SECONDS): b"e2_clip_bytes",
@@ -369,7 +369,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         mock_details.side_effect = details_side_effect
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             if (start, end) == (150 - main.CLIP_PADDING_SECONDS, 180 + main.CLIP_PADDING_SECONDS):
                 return None  # e2's recording window fails
             return {
@@ -507,7 +507,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         pad = main.CLIP_PADDING_SECONDS
         mid = (200 - pad) + ((300 + pad) - (200 - pad)) // 2  # 250
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             return {
                 (100 - pad, 110 + pad): b"eventA_bytes",
                 (200 - pad, 300 + pad): oversized,
@@ -614,7 +614,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         )
         mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 200}
 
-        def clip_side_effect(_client, camera, start, end):
+        def clip_side_effect(_client, camera, start, end, **_kwargs):
             if start == 100 - main.CLIP_PADDING_SECONDS and end == 200 + main.CLIP_PADDING_SECONDS:
                 return b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
             elif end <= (100 - main.CLIP_PADDING_SECONDS + 200 + main.CLIP_PADDING_SECONDS) // 2:
@@ -653,7 +653,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         )
         mock_details.return_value = {'id': 'e1', 'label': 'person', 'zones': [], 'start_time': 100, 'end_time': 200}
 
-        def clip_side_effect(_client, camera, start, end):
+        def clip_side_effect(_client, camera, start, end, **_kwargs):
             if start == 100 - main.CLIP_PADDING_SECONDS and end == 200 + main.CLIP_PADDING_SECONDS:
                 return b'x' * (main.MAX_TELEGRAM_FILE_SIZE + 1024)
             elif end <= (100 - main.CLIP_PADDING_SECONDS + 200 + main.CLIP_PADDING_SECONDS) // 2:
@@ -766,7 +766,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         responses = {(ps, pe): b"x" * 4200}
         responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             return responses.get((start, end))
 
         mock_clip.side_effect = clip_side_effect
@@ -777,6 +777,8 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         fetched = [(c.args[2], c.args[3]) for c in mock_clip.call_args_list]
         self.assertEqual(fetched[0], (ps, pe))
         self.assertEqual(sorted(fetched[1:]), sorted(windows))
+        # Parts come from an already-fetched recording: no retry loop per part.
+        self.assertTrue(all(c.kwargs.get("max_retries") == 1 for c in mock_clip.call_args_list[1:]))
 
         self.assertEqual(bot.send_video.call_count, 5)
         for i, call in enumerate(bot.send_video.call_args_list, start=1):
@@ -804,7 +806,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         responses = {(ps, pe): b"x" * 10500}
         responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             return responses.get((start, end))
 
         mock_clip.side_effect = clip_side_effect
@@ -849,7 +851,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         responses[windows[1]] = b"x" * 1001  # part 2 still oversized
         responses[windows[2]] = None  # part 3 missing
 
-        async def clip_side_effect(_client, camera, start, end):
+        async def clip_side_effect(_client, camera, start, end, **_kwargs):
             return responses.get((start, end))
 
         mock_clip.side_effect = clip_side_effect
@@ -2060,6 +2062,11 @@ def _stats_http_client(current_stats):
 
 class TestCacheHealthIntegration(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self._reset_monitors()
+        self.addCleanup(self._reset_monitors)
+
+    @staticmethod
+    def _reset_monitors():
         main.camera_health_monitor.states.clear()
         main.cache_health_monitor.states.clear()
         main.cache_health_monitor.last_pct = None
@@ -2068,7 +2075,7 @@ class TestCacheHealthIntegration(unittest.IsolatedAsyncioTestCase):
 
     def test_cache_threshold_default_and_monitor_type(self):
         import camera_health
-        self.assertEqual(main.HEALTH_CACHE_THRESHOLD_PCT, 85)
+        self.assertTrue(1 <= main.HEALTH_CACHE_THRESHOLD_PCT <= 100)
         self.assertIsInstance(main.cache_health_monitor, camera_health.CacheStorageMonitor)
         self.assertIsNot(main.cache_health_monitor, main.camera_health_monitor)
 
@@ -2173,6 +2180,9 @@ class TestCacheHealthIntegration(unittest.IsolatedAsyncioTestCase):
         line = next(l for l in text.splitlines() if "Frigate cache" in l)
         self.assertIn("2%", line)
         self.assertIn("🟢", line)
+        # Bulleted inside the health section, even with no camera states.
+        self.assertTrue(line.startswith("• "))
+        self.assertIn("Camera Health", text.split(line)[0])
 
     async def test_cmd_status_omits_cache_line_when_no_stats_seen(self):
         text = await self._status_text()

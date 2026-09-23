@@ -519,7 +519,7 @@ def test_cache_recovery_before_first_alert_is_silent():
     assert monitor.states[CACHE_KEY].first_failure_ts is None
 
 
-@pytest.mark.parametrize("uptime", [30, None], ids=["uptime_below_60", "uptime_missing"])
+@pytest.mark.parametrize("uptime", [30, None, "abc"], ids=["uptime_below_60", "uptime_missing", "uptime_non_numeric"])
 def test_cache_uptime_grace_skips_state_but_records_pct(uptime):
     monitor = _cache_monitor()
     stats = _cache_stats(2000.0, uptime=uptime)

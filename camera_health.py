@@ -456,8 +456,8 @@ class CacheStorageMonitor(CameraHealthMonitor):
         self.last_pct = self.last_used / self.last_total * 100
 
         # Same startup grace as camera checks: /status still gets the reading.
-        uptime = service.get("uptime") or 0
-        if uptime < 60:
+        uptime = service.get("uptime")
+        if not _is_number(uptime) or uptime < 60:
             return None
 
         return self.update_camera(CACHE_STORAGE_PATH, self.last_pct >= threshold_pct, now=now)
