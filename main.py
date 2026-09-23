@@ -138,8 +138,10 @@ MAX_EVENT_SPAN = get_int_setting("MAX_EVENT_SPAN", 300)  # hard cap on merged-gr
 CLIP_PADDING_SECONDS = get_int_setting("CLIP_PADDING_SECONDS", 5)  # extra seconds shown before/after the detected activity
 MAX_TELEGRAM_FILE_SIZE = get_int_setting("MAX_TELEGRAM_FILE_SIZE", 50 * 1024 * 1024)  # Telegram bot upload limit (50 MB)
 MAX_CLIP_PARTS = 10  # an oversized clip sends at most this many parts; the rest are dropped with a "truncated" note
-# Parts can exceed the pro-rata size: Frigate cuts on keyframes with whole-second inpoints.
-CLIP_SPLIT_SAFETY = 0.9
+# Parts can exceed the pro-rata size: Frigate stream-copies and cuts on keyframes with
+# whole-second inpoints. Observed ~5% overshoot at the real 50 MB limit on 4K HEVC
+# (47.3 MB part vs a 45 MB target at 0.9), so leave a wider margin.
+CLIP_SPLIT_SAFETY = 0.8
 
 # Shared Telegram API timeout kwargs for consistent usage across all media/message sends
 TELEGRAM_TIMEOUT_KWARGS = {

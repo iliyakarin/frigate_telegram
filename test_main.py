@@ -697,7 +697,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
     # ── N-part clip split ──────────────────────────────────────────────
     # MAX_TELEGRAM_FILE_SIZE is patched to 1000 bytes so fixtures stay tiny.
-    # Planned parts = max(2, ceil(size / (MAX * 0.9))) clamped to the window
+    # Planned parts = max(2, ceil(size / (MAX * 0.8))) clamped to the window
     # length; at most main.MAX_CLIP_PARTS (10) are fetched.
 
     def test_max_clip_parts_is_ten(self):
@@ -728,8 +728,9 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(main._planned_part_count(main.MAX_TELEGRAM_FILE_SIZE + 1024, 110), 2)
         with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
             self.assertEqual(main._planned_part_count(1001, 110), 2)
-            self.assertEqual(main._planned_part_count(4200, 110), 5)  # ceil(4.2 / 0.9)
-            self.assertEqual(main._planned_part_count(10500, 110), 12)  # ceil(10.5 / 0.9)
+            self.assertEqual(main._planned_part_count(4200, 110), 6)  # ceil(4.2 / 0.8)
+            self.assertEqual(main._planned_part_count(3800, 110), 5)  # ceil(4.75 / 0.8)
+            self.assertEqual(main._planned_part_count(10500, 110), 14)  # ceil(10.5 / 0.8)
             self.assertEqual(main._planned_part_count(4200, 3), 3)  # clamped by duration
 
     def _long_single_event_group(self):
@@ -763,7 +764,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         ps, pe = self._padded_window()
         windows = self._expected_windows(ps, pe, 5)
-        responses = {(ps, pe): b"x" * 4200}
+        responses = {(ps, pe): b"x" * 3800}  # ceil(3.8 / 0.8) = 5 parts
         responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
 
         async def clip_side_effect(_client, camera, start, end, **_kwargs):
@@ -803,7 +804,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         ps, pe = self._padded_window()
         windows = self._expected_windows(ps, pe, 12)
-        responses = {(ps, pe): b"x" * 10500}
+        responses = {(ps, pe): b"x" * 9000}  # ceil(9.0 / 0.8) = 12 parts
         responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
 
         async def clip_side_effect(_client, camera, start, end, **_kwargs):
@@ -846,7 +847,7 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
 
         ps, pe = self._padded_window()
         windows = self._expected_windows(ps, pe, 5)
-        responses = {(ps, pe): b"x" * 4200}
+        responses = {(ps, pe): b"x" * 3800}  # ceil(3.8 / 0.8) = 5 parts
         responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
         responses[windows[1]] = b"x" * 1001  # part 2 still oversized
         responses[windows[2]] = None  # part 3 missing
