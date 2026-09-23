@@ -695,6 +695,212 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         bot.send_photo.assert_called_once()
         self.assertEqual(bot.send_photo.call_args.kwargs['photo'], b'snap_bytes')
 
+    # ── N-part clip split ──────────────────────────────────────────────
+    # MAX_TELEGRAM_FILE_SIZE is patched to 1000 bytes so fixtures stay tiny.
+    # Planned parts = max(2, ceil(size / (MAX * 0.9))) clamped to the window
+    # length; at most main.MAX_CLIP_PARTS (10) are fetched.
+
+    def test_max_clip_parts_is_ten(self):
+        self.assertEqual(main.MAX_CLIP_PARTS, 10)
+
+    def test_split_windows_two_parts_matches_legacy_midpoint(self):
+        for start, end in [(95, 205), (95, 206), (0, 3)]:
+            mid = start + (end - start) // 2
+            self.assertEqual(main._split_windows(start, end, 2), [(start, mid), (mid, end)])
+
+    def test_split_windows_five_parts_are_contiguous_and_exact(self):
+        self.assertEqual(
+            main._split_windows(95, 205, 5),
+            [(95, 117), (117, 139), (139, 161), (161, 183), (183, 205)],
+        )
+        for start, end, n in [(0, 7, 5), (10, 22, 12), (95, 206, 5)]:
+            windows = main._split_windows(start, end, n)
+            self.assertEqual(len(windows), n)
+            self.assertEqual(windows[0][0], start)
+            self.assertEqual(windows[-1][1], end)
+            for (_, a_end), (b_start, _) in zip(windows, windows[1:]):
+                self.assertEqual(a_end, b_start)
+            for w_start, w_end in windows:
+                self.assertGreaterEqual(w_end - w_start, 1)
+
+    def test_planned_part_count(self):
+        # Real limit: the legacy "MAX + 1 KiB" fixture still plans 2 parts.
+        self.assertEqual(main._planned_part_count(main.MAX_TELEGRAM_FILE_SIZE + 1024, 110), 2)
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            self.assertEqual(main._planned_part_count(1001, 110), 2)
+            self.assertEqual(main._planned_part_count(4200, 110), 5)  # ceil(4.2 / 0.9)
+            self.assertEqual(main._planned_part_count(10500, 110), 12)  # ceil(10.5 / 0.9)
+            self.assertEqual(main._planned_part_count(4200, 3), 3)  # clamped by duration
+
+    def _long_single_event_group(self):
+        return grouping.PendingGroup(
+            camera="Backyard", labels={"person"}, review_ids=["rev1"], event_ids={"e1"},
+            first_start=100, last_activity_end=200, last_seen_at=200,
+        )
+
+    def _padded_window(self):
+        pad = main.CLIP_PADDING_SECONDS
+        return 100 - pad, 200 + pad
+
+    @staticmethod
+    def _expected_windows(start, end, n):
+        d = end - start
+        return [(start + i * d // n, start + (i + 1) * d // n) for i in range(n)]
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_splits_into_n_parts(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+        mock_snap.return_value = b"snap_bytes"
+
+        ps, pe = self._padded_window()
+        windows = self._expected_windows(ps, pe, 5)
+        responses = {(ps, pe): b"x" * 4200}
+        responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
+
+        async def clip_side_effect(_client, camera, start, end):
+            return responses.get((start, end))
+
+        mock_clip.side_effect = clip_side_effect
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.send_grouped_notification(bot, self._long_single_event_group(), http_client)
+
+        fetched = [(c.args[2], c.args[3]) for c in mock_clip.call_args_list]
+        self.assertEqual(fetched[0], (ps, pe))
+        self.assertEqual(sorted(fetched[1:]), sorted(windows))
+
+        self.assertEqual(bot.send_video.call_count, 5)
+        for i, call in enumerate(bot.send_video.call_args_list, start=1):
+            self.assertEqual(call.kwargs["video"], f"part{i}".encode())
+            self.assertIn(f"(Part {i}/5)", call.kwargs["caption"])
+            self.assertNotIn("truncated", call.kwargs["caption"])
+        bot.send_photo.assert_not_called()
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_truncates_to_max_clip_parts(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+        mock_snap.return_value = b"snap_bytes"
+
+        ps, pe = self._padded_window()
+        windows = self._expected_windows(ps, pe, 12)
+        responses = {(ps, pe): b"x" * 10500}
+        responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
+
+        async def clip_side_effect(_client, camera, start, end):
+            return responses.get((start, end))
+
+        mock_clip.side_effect = clip_side_effect
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.send_grouped_notification(bot, self._long_single_event_group(), http_client)
+
+        # Full clip + exactly the first 10 planned parts; parts 11-12 never fetched.
+        self.assertEqual(mock_clip.call_count, 11)
+        fetched = [(c.args[2], c.args[3]) for c in mock_clip.call_args_list]
+        self.assertEqual(sorted(fetched[1:]), sorted(windows[:10]))
+
+        self.assertEqual(bot.send_video.call_count, 10)
+        calls = bot.send_video.call_args_list
+        for i, call in enumerate(calls, start=1):
+            self.assertEqual(call.kwargs["video"], f"part{i}".encode())
+            self.assertIn(f"(Part {i}/12)", call.kwargs["caption"])
+        for call in calls[:-1]:
+            self.assertNotIn("truncated", call.kwargs["caption"])
+        last_caption = calls[-1].kwargs["caption"]
+        self.assertIn("clip truncated", last_caption)
+        self.assertIn("10 of 12", last_caption)
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_skips_bad_middle_parts_with_warning(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+        mock_snap.return_value = b"snap_bytes"
+
+        ps, pe = self._padded_window()
+        windows = self._expected_windows(ps, pe, 5)
+        responses = {(ps, pe): b"x" * 4200}
+        responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
+        responses[windows[1]] = b"x" * 1001  # part 2 still oversized
+        responses[windows[2]] = None  # part 3 missing
+
+        async def clip_side_effect(_client, camera, start, end):
+            return responses.get((start, end))
+
+        mock_clip.side_effect = clip_side_effect
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            with self.assertLogs("frigate-telegram", level="WARNING") as logs:
+                await main.send_grouped_notification(bot, self._long_single_event_group(), http_client)
+
+        self.assertEqual(bot.send_video.call_count, 3)
+        calls = bot.send_video.call_args_list
+        self.assertEqual([c.kwargs["video"] for c in calls], [b"part1", b"part4", b"part5"])
+        self.assertIn("(Part 1/5)", calls[0].kwargs["caption"])
+        self.assertIn("(Part 4/5)", calls[1].kwargs["caption"])
+        self.assertIn("(Part 5/5)", calls[2].kwargs["caption"])
+        # One warning per dropped part, naming the event.
+        part_warnings = [m for m in logs.output if "WARNING" in m and "e1" in m]
+        self.assertGreaterEqual(len(part_warnings), 2)
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_does_not_split_oversized_event_clip_fallback(
+        self, mock_details, mock_clip, mock_snap, mock_media
+    ):
+        """Oversized data from the event clip.mp4 fallback (recording endpoint
+        returned nothing) must not be time-split via the recording endpoint —
+        recordings are evidently unavailable for that window."""
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        bot.send_photo = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+        mock_snap.return_value = None
+        mock_clip.return_value = None  # recording endpoint: nothing
+
+        async def media_side_effect(_client, event_id, kind):
+            return {"clip": b"x" * 4200, "snapshot": b"snap_bytes"}.get(kind)
+
+        mock_media.side_effect = media_side_effect
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            with self.assertLogs("frigate-telegram", level="WARNING"):
+                await main.send_grouped_notification(bot, self._long_single_event_group(), http_client)
+
+        ps, pe = self._padded_window()
+        mock_clip.assert_called_once_with(http_client, "Backyard", ps, pe)
+        bot.send_video.assert_not_called()
+        bot.send_photo.assert_called_once()
+        self.assertEqual(bot.send_photo.call_args.kwargs["photo"], b"snap_bytes")
+
     @patch('main.fetch_event_media', return_value=None)
     @patch('main.fetch_camera_snapshot')
     @patch('main.fetch_recording_clip')
@@ -1824,6 +2030,153 @@ class TestCameraHealthIntegration(unittest.IsolatedAsyncioTestCase):
         # otherwise "None configured (22:00-06:00)" misleadingly implies an active window.
         self.assertNotIn("22:00", text)
         self.assertNotIn("06:00", text)
+
+
+def _stats_with_cache(used, total=2048.0, uptime=120, cameras=None):
+    return {
+        "service": {
+            "uptime": uptime,
+            "storage": {"/tmp/cache": {"total": total, "used": used, "free": total - used, "mount_type": "tmpfs"}},
+        },
+        "cameras": cameras or {},
+    }
+
+
+def _stats_http_client(current_stats):
+    """http_client whose /api/stats returns current_stats[0] (mutable holder)."""
+    async def mock_get(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "/api/stats" in url:
+            resp.json.return_value = current_stats[0]
+        else:
+            resp.json.return_value = {"lines": []}
+        return resp
+
+    http_client = MagicMock()
+    http_client.get = AsyncMock(side_effect=mock_get)
+    return http_client
+
+
+class TestCacheHealthIntegration(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        main.camera_health_monitor.states.clear()
+        main.cache_health_monitor.states.clear()
+        main.cache_health_monitor.last_pct = None
+        main.cache_health_monitor.last_used = None
+        main.cache_health_monitor.last_total = None
+
+    def test_cache_threshold_default_and_monitor_type(self):
+        import camera_health
+        self.assertEqual(main.HEALTH_CACHE_THRESHOLD_PCT, 85)
+        self.assertIsInstance(main.cache_health_monitor, camera_health.CacheStorageMonitor)
+        self.assertIsNot(main.cache_health_monitor, main.camera_health_monitor)
+
+    async def test_full_cache_sends_alert_then_recovery(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        current = [_stats_with_cache(2000.0)]
+        http_client = _stats_http_client(current)
+
+        await main.check_camera_health_and_alert(bot, http_client, now=100.0)
+        bot.send_message.assert_not_called()  # debounce
+
+        await main.check_camera_health_and_alert(bot, http_client, now=161.0)
+        bot.send_message.assert_called_once()
+        kwargs = bot.send_message.call_args.kwargs
+        self.assertEqual(kwargs["chat_id"], main.TELEGRAM_CHAT_ID)
+        self.assertEqual(kwargs["parse_mode"], main.ParseMode.HTML)
+        self.assertIn("/tmp/cache", kwargs["text"])
+        self.assertIn("98%", kwargs["text"])
+        self.assertNotIn("fps", kwargs["text"].lower())
+
+        # Cache drains after a Frigate restart.
+        current[0] = _stats_with_cache(32.1)
+        await main.check_camera_health_and_alert(bot, http_client, now=200.0)
+        self.assertEqual(bot.send_message.call_count, 2)
+        recovery = bot.send_message.call_args.kwargs["text"]
+        self.assertIn("cache", recovery.lower())
+        self.assertIn("recovered", recovery.lower())
+
+    @patch("main.fetch_review_items", return_value=[])
+    async def test_polling_tick_dispatches_cache_alert(self, mock_reviews):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        http_client = _stats_http_client([_stats_with_cache(2000.0)])
+
+        pending = {}
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=0, now=100.0)
+        await main._polling_tick(bot, http_client, pending, last_poll_ts=100.0, now=165.0)
+        texts = [c.kwargs["text"] for c in bot.send_message.call_args_list]
+        self.assertEqual(len([t for t in texts if "/tmp/cache" in t]), 1)
+
+    async def test_cache_alert_sent_even_if_camera_evaluation_raises(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        http_client = _stats_http_client([_stats_with_cache(2000.0)])
+
+        with patch.object(main.camera_health_monitor, "evaluate_stats", side_effect=RuntimeError("boom")):
+            await main.check_camera_health_and_alert(bot, http_client, now=100.0)
+            await main.check_camera_health_and_alert(bot, http_client, now=161.0)
+
+        bot.send_message.assert_called_once()
+        self.assertIn("/tmp/cache", bot.send_message.call_args.kwargs["text"])
+
+    async def test_camera_alert_sent_even_if_cache_evaluation_raises(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        cameras = {"FrontDoor": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"}}
+        stats = _stats_with_cache(32.1, cameras=cameras)
+        stats["service"]["storage"]["/tmp/cache"] = ["not", "a", "dict"]  # malformed
+        http_client = _stats_http_client([stats])
+
+        with patch.object(main.cache_health_monitor, "evaluate", side_effect=RuntimeError("boom")):
+            await main.check_camera_health_and_alert(bot, http_client, now=100.0)
+            await main.check_camera_health_and_alert(bot, http_client, now=161.0)
+
+        bot.send_message.assert_called_once()
+        self.assertIn("FrontDoor is OFFLINE", bot.send_message.call_args.kwargs["text"])
+
+    async def test_camera_alert_sent_with_malformed_storage_payload(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        cameras = {"FrontDoor": {"camera_fps": 0.0, "expected_fps": 5.0, "connection_quality": "unusable"}}
+        stats = _stats_with_cache(32.1, cameras=cameras)
+        stats["service"]["storage"] = {"/tmp/cache": {"total": "big", "used": None}}
+        http_client = _stats_http_client([stats])
+
+        await main.check_camera_health_and_alert(bot, http_client, now=100.0)
+        await main.check_camera_health_and_alert(bot, http_client, now=161.0)
+
+        bot.send_message.assert_called_once()
+        self.assertIn("FrontDoor is OFFLINE", bot.send_message.call_args.kwargs["text"])
+        self.assertIsNone(main.cache_health_monitor.last_pct)
+
+    async def _status_text(self):
+        update = MagicMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        update.effective_chat.send_message = AsyncMock()
+        await main.cmd_status(update, MagicMock())
+        call = update.effective_chat.send_message.call_args
+        return call.kwargs.get("text") or call.args[0]
+
+    async def test_cmd_status_shows_cache_usage_red_when_over_threshold(self):
+        main.cache_health_monitor.evaluate(_stats_with_cache(2000.0), main.HEALTH_CACHE_THRESHOLD_PCT, now=100.0)
+        text = await self._status_text()
+        line = next(l for l in text.splitlines() if "Frigate cache" in l)
+        self.assertIn("98%", line)
+        self.assertIn("🔴", line)
+
+    async def test_cmd_status_shows_cache_usage_green_when_healthy(self):
+        main.cache_health_monitor.evaluate(_stats_with_cache(32.1), main.HEALTH_CACHE_THRESHOLD_PCT, now=100.0)
+        text = await self._status_text()
+        line = next(l for l in text.splitlines() if "Frigate cache" in l)
+        self.assertIn("2%", line)
+        self.assertIn("🟢", line)
+
+    async def test_cmd_status_omits_cache_line_when_no_stats_seen(self):
+        text = await self._status_text()
+        self.assertNotIn("Frigate cache", text)
 
 
 if __name__ == "__main__":

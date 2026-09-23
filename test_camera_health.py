@@ -1,6 +1,7 @@
 """Unit tests for Camera Health Monitor data models, state machine, and alerting."""
 
 import pytest
+import camera_health
 from camera_health import (
     CameraHealthMonitor,
     CameraHealthState,
@@ -382,3 +383,221 @@ async def test_fetch_log_error_detail_fallback():
     async with httpx.AsyncClient(transport=transport) as client:
         detail = await fetch_log_error_detail(client, "http://frigate:5000", "RightBackyard")
         assert detail is None
+
+
+# ─────────────── Frigate /tmp/cache storage alert (CacheStorageMonitor) ───────────────
+# CacheStorageMonitor is referenced lazily (inside each test) so a missing
+# class fails only these tests, not collection of the whole module.
+
+
+CACHE_KEY = "/tmp/cache"
+
+
+def _cache_monitor():
+    return camera_health.CacheStorageMonitor(monitored_cameras=None, debounce_seconds=60)
+
+
+def _cache_stats(used, total=2048.0, uptime=120):
+    """/api/stats payload shaped like Frigate 0.16.4 (MiB floats)."""
+    return {
+        "service": {
+            "uptime": uptime,
+            "storage": {
+                "/media/frigate/recordings": {"total": 1006828.1, "used": 210071.4, "free": 745540.7, "mount_type": "ext4"},
+                CACHE_KEY: {"total": total, "used": used, "free": (total or 0) - (used or 0), "mount_type": "tmpfs"},
+            },
+        },
+        "cameras": {},
+    }
+
+
+def test_cache_storage_path_constant():
+    assert camera_health.CACHE_STORAGE_PATH == "/tmp/cache"
+
+
+def test_cache_below_threshold_no_alert():
+    monitor = _cache_monitor()
+    # Prod healthy numbers: 2048 MiB tmpfs, 32.1 MiB used (~1.6%).
+    assert monitor.evaluate(_cache_stats(32.1), 85, now=1000.0) is None
+    assert monitor.evaluate(_cache_stats(32.1), 85, now=1200.0) is None
+    assert monitor.last_pct == pytest.approx(32.1 / 2048.0 * 100)
+
+
+def test_cache_last_fields_track_observed_usage():
+    monitor = _cache_monitor()
+    assert monitor.last_pct is None
+    monitor.evaluate(_cache_stats(1000.0, total=2048.0), 85, now=1000.0)
+    assert monitor.last_pct == pytest.approx(1000.0 / 2048.0 * 100)
+    assert monitor.last_used == pytest.approx(1000.0)
+    assert monitor.last_total == pytest.approx(2048.0)
+
+
+def test_cache_over_threshold_debounced_then_alerts_with_storage_wording():
+    monitor = _cache_monitor()
+    full = _cache_stats(2000.0)
+
+    assert monitor.evaluate(full, 85, now=1000.0) is None  # debounce starts
+    assert monitor.evaluate(full, 85, now=1030.0) is None  # 30s < 60s
+
+    alert = monitor.evaluate(full, 85, now=1061.0)
+    assert alert is not None
+    assert alert.alert_type == "offline"
+    assert alert.alert_count == 1
+    msg = alert.message
+    assert "cache" in msg.lower()
+    assert "/tmp/cache" in msg
+    assert "fps" not in msg.lower()
+    assert "98%" in msg  # 2000/2048 = 97.66% → rendered {pct:.0f}
+    assert "2000" in msg and "2048" in msg  # used/total MiB
+    assert "docker compose restart frigate" in msg
+    assert "1/5" in msg
+    assert "Next in" not in msg  # adjudication #10: no "Next in" line
+    assert "<b>Time:</b>" in msg
+
+
+def test_cache_threshold_boundary_is_inclusive():
+    monitor = _cache_monitor()
+    at_threshold = _cache_stats(850.0, total=1000.0)  # exactly 85%
+    monitor.evaluate(at_threshold, 85, now=1000.0)
+    alert = monitor.evaluate(at_threshold, 85, now=1060.0)
+    assert alert is not None
+    assert alert.alert_type == "offline"
+
+
+def test_cache_escalation_follows_camera_schedule():
+    monitor = _cache_monitor()
+    full = _cache_stats(2000.0)
+
+    monitor.evaluate(full, 85, now=1000.0)
+    alert = monitor.evaluate(full, 85, now=1060.0)
+    assert alert.alert_count == 1
+
+    t = 1060.0
+    for expected_count, delay in zip(range(2, 6), camera_health.ESCALATION_DELAYS_SECONDS):
+        assert monitor.evaluate(full, 85, now=t + delay - 1) is None
+        t = t + delay
+        alert = monitor.evaluate(full, 85, now=t)
+        assert alert is not None
+        assert alert.alert_count == expected_count
+        assert f"{expected_count}/5" in alert.message
+        assert "/tmp/cache" in alert.message
+
+    # After 5 alerts it stays silent until recovery.
+    assert monitor.evaluate(full, 85, now=t + 10 * 86400) is None
+
+
+def test_cache_recovery_after_alert_sends_recovery_and_resets_state():
+    monitor = _cache_monitor()
+    full = _cache_stats(2000.0)
+    monitor.evaluate(full, 85, now=1000.0)
+    assert monitor.evaluate(full, 85, now=1060.0) is not None
+
+    recovery = monitor.evaluate(_cache_stats(32.1), 85, now=1125.0)
+    assert recovery is not None
+    assert recovery.alert_type == "recovery"
+    msg = recovery.message
+    assert "cache" in msg.lower()
+    assert "recovered" in msg.lower()
+    assert "fps" not in msg.lower()
+    assert "2%" in msg  # 32.1/2048 = 1.57% → {pct:.0f}
+    assert "2m 5s" in msg  # downtime from first failure at t=1000
+    assert "<b>Time:</b>" in msg
+
+    state = monitor.states[CACHE_KEY]
+    assert state.notified_offline is False
+    assert state.alert_count == 0
+    assert state.first_failure_ts is None
+
+    # Next healthy tick is quiet.
+    assert monitor.evaluate(_cache_stats(32.1), 85, now=1200.0) is None
+
+
+def test_cache_recovery_before_first_alert_is_silent():
+    monitor = _cache_monitor()
+    assert monitor.evaluate(_cache_stats(2000.0), 85, now=1000.0) is None
+    assert monitor.evaluate(_cache_stats(32.1), 85, now=1030.0) is None
+    assert monitor.states[CACHE_KEY].first_failure_ts is None
+
+
+@pytest.mark.parametrize("uptime", [30, None], ids=["uptime_below_60", "uptime_missing"])
+def test_cache_uptime_grace_skips_state_but_records_pct(uptime):
+    monitor = _cache_monitor()
+    stats = _cache_stats(2000.0, uptime=uptime)
+    if uptime is None:
+        del stats["service"]["uptime"]
+    assert monitor.evaluate(stats, 85, now=1000.0) is None
+    assert monitor.evaluate(stats, 85, now=2000.0) is None
+    assert CACHE_KEY not in monitor.states
+    # /status still gets a fresh reading during the grace window.
+    assert monitor.last_pct == pytest.approx(2000.0 / 2048.0 * 100)
+
+
+def _drop(path):
+    """Build a malformed payload by mutating a fresh full-cache payload."""
+    def build():
+        stats = _cache_stats(2000.0)
+        path(stats)
+        return stats
+    return build
+
+
+@pytest.mark.parametrize(
+    "build_stats",
+    [
+        lambda: None,
+        _drop(lambda s: s.__setitem__("service", None)),
+        _drop(lambda s: s["service"].pop("storage")),
+        _drop(lambda s: s["service"].__setitem__("storage", None)),
+        _drop(lambda s: s["service"]["storage"].pop(CACHE_KEY)),
+        _drop(lambda s: s["service"]["storage"].__setitem__(CACHE_KEY, {})),
+        _drop(lambda s: s["service"]["storage"].__setitem__(CACHE_KEY, None)),
+        _drop(lambda s: s["service"]["storage"][CACHE_KEY].__setitem__("total", 0)),
+        _drop(lambda s: s["service"]["storage"][CACHE_KEY].__setitem__("total", None)),
+        _drop(lambda s: s["service"]["storage"][CACHE_KEY].__setitem__("used", None)),
+        _drop(lambda s: s["service"]["storage"][CACHE_KEY].__setitem__("used", "lots")),
+    ],
+    ids=[
+        "stats_none",
+        "service_none",
+        "storage_missing",
+        "storage_none",
+        "cache_entry_missing",
+        "cache_entry_empty",
+        "cache_entry_none",
+        "total_zero",
+        "total_none",
+        "used_none",
+        "used_non_numeric",
+    ],
+)
+def test_cache_unavailable_payload_is_quiet_noop(build_stats):
+    monitor = _cache_monitor()
+    for now in (1000.0, 1100.0, 1200.0):
+        assert monitor.evaluate(build_stats(), 85, now=now) is None
+    assert CACHE_KEY not in monitor.states
+    assert monitor.last_pct is None
+
+
+def test_cache_unavailable_tick_does_not_reset_pending_debounce():
+    monitor = _cache_monitor()
+    full = _cache_stats(2000.0)
+    monitor.evaluate(full, 85, now=1000.0)
+    assert monitor.evaluate(None, 85, now=1030.0) is None  # untouched state
+    alert = monitor.evaluate(full, 85, now=1061.0)
+    assert alert is not None and alert.alert_type == "offline"
+
+
+def test_cache_threshold_parameter_is_respected():
+    stats = _cache_stats(1100.0)  # 53.7%
+
+    strict = _cache_monitor()
+    strict.evaluate(stats, 85, now=1000.0)
+    assert strict.evaluate(stats, 85, now=1100.0) is None
+
+    lax = _cache_monitor()
+    lax.evaluate(stats, 50, now=1000.0)
+    alert = lax.evaluate(stats, 50, now=1100.0)
+    assert alert is not None
+    assert alert.alert_type == "offline"
+    assert "54%" in alert.message
+
