@@ -7,6 +7,7 @@ notifications to Telegram with event details in the caption.
 import asyncio
 import html
 import json
+import math
 import logging
 import os
 import signal
@@ -22,7 +23,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from dotenv import load_dotenv
 from camera_health import (
+    CacheStorageMonitor,
     CameraHealthMonitor,
+    HealthAlert,
     fetch_log_error_detail,
     format_downtime,
     parse_monitored_cameras,
@@ -101,6 +104,10 @@ MONITOR_CONFIG_RAW = os.environ.get("MONITOR_CONFIG", "")
 HEALTH_MONITOR_CAMERAS_RAW = os.environ.get("HEALTH_MONITOR_CAMERAS", "")
 HEALTH_MONITOR_CAMERAS = parse_monitored_cameras(HEALTH_MONITOR_CAMERAS_RAW)
 camera_health_monitor = CameraHealthMonitor(monitored_cameras=HEALTH_MONITOR_CAMERAS, debounce_seconds=60)
+# Alert when Frigate's /tmp/cache usage >= this % (clamped to 1..100): a full
+# cache means the recording maintainer stalled and recordings aren't saved.
+HEALTH_CACHE_THRESHOLD_PCT = min(100, max(1, get_int_setting("HEALTH_CACHE_THRESHOLD_PCT", 85)))
+cache_health_monitor = CacheStorageMonitor(monitored_cameras=None, debounce_seconds=60)
 
 # Night-only alerts: cameras in this set only notify inside the configured window.
 # Empty set (unset/empty env var) means the feature is off — no camera is restricted.
@@ -130,6 +137,9 @@ EVENT_MERGE_GAP = get_int_setting("EVENT_MERGE_GAP", 45)  # seconds of quiet bef
 MAX_EVENT_SPAN = get_int_setting("MAX_EVENT_SPAN", 300)  # hard cap on merged-group duration
 CLIP_PADDING_SECONDS = get_int_setting("CLIP_PADDING_SECONDS", 5)  # extra seconds shown before/after the detected activity
 MAX_TELEGRAM_FILE_SIZE = get_int_setting("MAX_TELEGRAM_FILE_SIZE", 50 * 1024 * 1024)  # Telegram bot upload limit (50 MB)
+MAX_CLIP_PARTS = 10  # an oversized clip sends at most this many parts; the rest are dropped with a "truncated" note
+# Parts can exceed the pro-rata size: Frigate cuts on keyframes with whole-second inpoints.
+CLIP_SPLIT_SAFETY = 0.9
 
 # Shared Telegram API timeout kwargs for consistent usage across all media/message sends
 TELEGRAM_TIMEOUT_KWARGS = {
@@ -796,6 +806,22 @@ async def _send_fallback_gif(bot: Bot, gif_data: bytes, caption: str) -> None:
     )
 
 
+def _split_windows(start: int, end: int, n: int) -> list[tuple[int, int]]:
+    """Split [start, end] into n contiguous integer windows (callers ensure 1 <= n <= end - start)."""
+    d = end - start
+    return [(start + i * d // n, start + (i + 1) * d // n) for i in range(n)]
+
+
+def _planned_part_count(size_bytes: int, duration_s: int) -> int:
+    """Parts needed so each stays under MAX_TELEGRAM_FILE_SIZE, at >= 1 s per part.
+
+    Reads MAX_TELEGRAM_FILE_SIZE at call time (not as a default arg) so it
+    follows the module global.
+    """
+    n = max(2, math.ceil(size_bytes / (MAX_TELEGRAM_FILE_SIZE * CLIP_SPLIT_SAFETY)))
+    return min(n, duration_s)
+
+
 async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: httpx.AsyncClient) -> None:
     """Send a **single** consolidated Telegram message for a notification group.
 
@@ -819,9 +845,9 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
     5. Send ONE message: video(s) → GIF (event preview.gif, only fetched
        once no clip is available at all) → photo → text-only. Multiple
        successful per-event clips are sent as separate videos tagged
-       "(Event N/M)"; an individual event's clip that still exceeds
-       Telegram's 50MB limit is split into two time-halves of that event's
-       own window.
+       "(Event N/M)"; an individual event's recording clip that still
+       exceeds Telegram's 50MB limit is split into N time-slices of that
+       event's own window (at most MAX_CLIP_PARTS are fetched and sent).
     """
     details_list = await asyncio.gather(
         *[fetch_event_details(http_client, event_id) for event_id in group.event_ids]
@@ -869,13 +895,21 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         (event_id, None, None) for event_id in group.event_ids
     ]
 
-    async def _fetch_event_clip(event_id: str, start: float | None, end: float | None) -> bytes | None:
+    async def _fetch_event_clip(
+        event_id: str, start: float | None, end: float | None
+    ) -> tuple[bytes | None, tuple[int, int] | None]:
+        """Return (clip, padded window) — window is None unless the clip came
+        from the recording endpoint, the only source that can be re-sliced by
+        time. An event clip.mp4 fallback means recordings for that window are
+        evidently unavailable, so splitting it via the recording endpoint is moot."""
         if start is None:
-            return await fetch_event_media(http_client, event_id, "clip")
+            return await fetch_event_media(http_client, event_id, "clip"), None
         pad_start = max(0, int(start) - CLIP_PADDING_SECONDS)
         pad_end = int(end or start) + CLIP_PADDING_SECONDS
         data = await fetch_recording_clip(http_client, group.camera, pad_start, pad_end)
-        return data or await fetch_event_media(http_client, event_id, "clip")
+        if data:
+            return data, (pad_start, pad_end)
+        return await fetch_event_media(http_client, event_id, "clip"), None
 
     # Snapshot fetched concurrently with the clips — it's only used as a
     # video thumbnail or as the fallback photo, never needs to wait on them.
@@ -895,40 +929,68 @@ async def send_grouped_notification(bot: Bot, group: PendingGroup, http_client: 
         photo_data = await fetch_camera_snapshot(http_client, group.camera)
 
     # Resolve each successful event to the video part(s) it actually
-    # contributes — an event whose clip is oversized AND unsplittable (no
-    # window) or whose split halves both fail contributes none. The
-    # "(Event N/M)" tag is built from events that actually contribute below,
-    # not from `successful`, so it never promises a video that never arrives.
-    successful = [(eid, s, e, data) for (eid, s, e), data in zip(events_for_clips, event_clips) if data]
+    # contributes — an event whose clip is oversized AND unsplittable (not
+    # from the recording endpoint) or whose parts all fail contributes none.
+    # The "(Event N/M)" tag is built from events that actually contribute
+    # below, not from `successful`, so it never promises a video that never
+    # arrives.
+    successful = [
+        (eid, data, window)
+        for (eid, _s, _e), (data, window) in zip(events_for_clips, event_clips)
+        if data
+    ]
+    # Drop the other reference so an oversized full clip (can be hundreds of
+    # MB) is freed before its parts are fetched.
+    event_clips = None
     event_parts: list[tuple[str, list[tuple[bytes, str]]]] = []
-    for eid, s, e, data in successful:
+    for i in range(len(successful)):
+        eid, data, window = successful[i]
+        successful[i] = None
         if len(data) <= MAX_TELEGRAM_FILE_SIZE:
             event_parts.append((eid, [(data, "")]))
             continue
-        # Individual event's own clip still exceeds 50MB — split it into
-        # two time-halves of its own window (needs a real window; a
-        # pre-generated clip fetched without one can't be split by time).
-        if s is None:
-            logger.warning("Clip for event %s on %s exceeds size limit with no window to split", eid, group.camera)
+        size = len(data)
+        data = None  # release the full clip; only its size is needed now
+        if window is None:
+            logger.warning(
+                "Clip for event %s on %s (%d bytes) exceeds size limit and has no recording window to split",
+                eid, group.camera, size,
+            )
             event_parts.append((eid, []))
             continue
-        pad_start = max(0, int(s) - CLIP_PADDING_SECONDS)
-        pad_end = int(e or s) + CLIP_PADDING_SECONDS
-        mid = pad_start + (pad_end - pad_start) // 2
+        pad_start, pad_end = window
+        duration = pad_end - pad_start
+        if duration < 2:
+            logger.warning("Clip for event %s on %s exceeds size limit; window too short to split", eid, group.camera)
+            event_parts.append((eid, []))
+            continue
+        n = _planned_part_count(size, duration)
+        to_fetch = _split_windows(pad_start, pad_end, n)[:MAX_CLIP_PARTS]
+        logger.info(
+            "Clip for event %s on %s (%d bytes) exceeds %d MB limit; splitting into %d parts",
+            eid, group.camera, size, MAX_TELEGRAM_FILE_SIZE // (1024 * 1024), n,
+        )
+        if n > MAX_CLIP_PARTS:
+            logger.info("Event %s on %s: sending only the first %d of %d parts", eid, group.camera, MAX_CLIP_PARTS, n)
+        # Fetched sequentially, not gathered: each Frigate clip request spawns
+        # its own ffmpeg writing into /tmp/cache. Worst case this adds up to
+        # MAX_CLIP_PARTS sequential fetches (+ uploads) inside the polling tick.
         parts: list[tuple[bytes, str]] = []
-        if mid > pad_start and pad_end > mid:
-            logger.info(
-                "Clip for event %s on %s (%d bytes) exceeds %d MB limit; splitting into 2 parts",
-                eid, group.camera, len(data), MAX_TELEGRAM_FILE_SIZE // (1024 * 1024),
+        for part_idx, (w_start, w_end) in enumerate(to_fetch, start=1):
+            part = await fetch_recording_clip(http_client, group.camera, w_start, w_end)
+            if not part or len(part) > MAX_TELEGRAM_FILE_SIZE:
+                logger.warning(
+                    "Event %s on %s: part %d/%d (%d bytes) missing or still over the size limit; skipping",
+                    eid, group.camera, part_idx, n, len(part or b""),
+                )
+                continue
+            parts.append((part, f"\n\n📹 <i>(Part {part_idx}/{n})</i>"))
+        if parts and n > MAX_CLIP_PARTS:
+            last_bytes, last_suffix = parts[-1]
+            parts[-1] = (
+                last_bytes,
+                f"{last_suffix} <i>(clip truncated: only the first {MAX_CLIP_PARTS} of {n} parts were fetched)</i>",
             )
-            clip1, clip2 = await asyncio.gather(
-                fetch_recording_clip(http_client, group.camera, pad_start, mid),
-                fetch_recording_clip(http_client, group.camera, mid, pad_end),
-            )
-            if clip1 and len(clip1) <= MAX_TELEGRAM_FILE_SIZE:
-                parts.append((clip1, "\n\n📹 <i>(Part 1/2)</i>"))
-            if clip2 and len(clip2) <= MAX_TELEGRAM_FILE_SIZE:
-                parts.append((clip2, "\n\n📹 <i>(Part 2/2)</i>"))
         event_parts.append((eid, parts))
 
     contributing = [(eid, parts) for eid, parts in event_parts if parts]
@@ -1128,6 +1190,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("")
         lines.append("📹 <b>Camera Health:</b>")
         lines.extend(health_lines)
+    cache_pct = cache_health_monitor.last_pct
+    if cache_pct is not None:
+        cache_emoji = "🔴" if cache_pct >= HEALTH_CACHE_THRESHOLD_PCT else "🟢"
+        lines.append(f"💾 <b>Frigate cache:</b> {cache_emoji} {cache_pct:.0f}%")
 
     lines.extend([
         "",
@@ -1558,6 +1624,15 @@ async def check_camera_health_and_alert(
             logger.debug("Failed to fetch Frigate stats for health check: %s", exc)
             return
 
+        # Cache check runs first in its own guard so a failure in either the
+        # cache or the camera evaluation never suppresses the other's alert.
+        try:
+            cache_alert = cache_health_monitor.evaluate(stats_data, HEALTH_CACHE_THRESHOLD_PCT, now=now)
+            if cache_alert is not None:
+                await _send_health_alert(bot, cache_alert)
+        except Exception as exc:
+            logger.error("Frigate cache health check failed: %s", exc)
+
         alerts = camera_health_monitor.evaluate_stats(stats_data, now=now)
         for alert in alerts:
             if alert.alert_type == "offline":
@@ -1577,17 +1652,22 @@ async def check_camera_health_and_alert(
                 except Exception as exc:
                     logger.debug("Failed to fetch log error detail for %s: %s", alert.camera, exc)
 
-            try:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=alert.message,
-                    parse_mode=ParseMode.HTML,
-                    **TELEGRAM_TIMEOUT_KWARGS,
-                )
-            except Exception as exc:
-                logger.error("Failed to send camera health alert for %s: %s", alert.camera, exc)
+            await _send_health_alert(bot, alert)
     except Exception as exc:
         logger.error("Camera health check failed: %s", exc)
+
+
+async def _send_health_alert(bot: Bot, alert: HealthAlert) -> None:
+    """Send a health alert; a send failure is logged, never raised."""
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=alert.message,
+            parse_mode=ParseMode.HTML,
+            **TELEGRAM_TIMEOUT_KWARGS,
+        )
+    except Exception as exc:
+        logger.error("Failed to send health alert for %s: %s", alert.camera, exc)
 
 
 async def _polling_tick(

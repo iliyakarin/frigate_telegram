@@ -395,3 +395,108 @@ async def fetch_log_error_detail(
 
     return None
 
+
+
+# ─────────────── Frigate recording cache (/tmp/cache) fill alert ───────────────
+
+# Frigate's recording maintainer moves ~10s segments out of this tmpfs. When it
+# stalls, the cache fills to 100%, ffmpeg hits "No space left on device" and no
+# recordings are written (clip.mp4 comes back 0 bytes) until Frigate restarts.
+CACHE_STORAGE_PATH = "/tmp/cache"
+
+
+def _is_number(value: Any) -> bool:
+    # bool is an int subclass; a boolean is never a real MiB reading.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+class CacheStorageMonitor(CameraHealthMonitor):
+    """Reuses the camera debounce/escalation/recovery state machine for the
+    /tmp/cache fill level, keyed by CACHE_STORAGE_PATH.
+
+    A separate instance (not a pseudo-camera on the camera monitor) keeps it out
+    of HEALTH_MONITOR_CAMERAS filtering and the per-camera /status listing. Only
+    the message wording differs, so the two formatters `update_camera` calls are
+    overridden to render storage text from the last observed reading.
+    """
+
+    def __init__(self, monitored_cameras: list[str] | None = None, debounce_seconds: float = 60.0) -> None:
+        super().__init__(monitored_cameras=monitored_cameras, debounce_seconds=debounce_seconds)
+        # Last reading (MiB / percent), None when unavailable. Read by /status.
+        self.last_pct: float | None = None
+        self.last_used: float | None = None
+        self.last_total: float | None = None
+
+    def evaluate(
+        self,
+        stats_data: dict[str, Any] | None,
+        threshold_pct: float,
+        now: float | None = None,
+    ) -> HealthAlert | None:
+        """Evaluate the /tmp/cache entry of an /api/stats payload."""
+        now = time.time() if now is None else now
+
+        # Same `or {}` rationale as evaluate_stats: keys can be present-but-None.
+        # isinstance guards: Frigate writes `{}` when disk_usage fails, and a
+        # malformed payload must be a quiet no-op, never break the camera check.
+        service = (stats_data or {}).get("service") or {}
+        storage = service.get("storage") if isinstance(service, dict) else None
+        entry = storage.get(CACHE_STORAGE_PATH) if isinstance(storage, dict) else None
+        used = entry.get("used") if isinstance(entry, dict) else None
+        total = entry.get("total") if isinstance(entry, dict) else None
+
+        if not (_is_number(used) and _is_number(total) and total > 0):
+            # Unavailable reading: leave the state machine untouched so a
+            # pending debounce/escalation isn't reset by one bad tick.
+            self.last_pct = self.last_used = self.last_total = None
+            return None
+
+        self.last_used = float(used)
+        self.last_total = float(total)
+        self.last_pct = self.last_used / self.last_total * 100
+
+        # Same startup grace as camera checks: /status still gets the reading.
+        uptime = service.get("uptime") or 0
+        if uptime < 60:
+            return None
+
+        return self.update_camera(CACHE_STORAGE_PATH, self.last_pct >= threshold_pct, now=now)
+
+    def format_offline_alert(
+        self,
+        camera: str,
+        current_fps: float,
+        expected_fps: float,
+        alert_count: int,
+        error_detail: str | None = None,
+        timestamp_str: str | None = None,
+    ) -> str:
+        """Storage wording for the offline alert (fps args are ignored)."""
+        if timestamp_str is None:
+            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"🚨 <b>Frigate recording cache almost full</b>\n\n"
+            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct or 0:.0f}% "
+            f"({self.last_used or 0:.0f}/{self.last_total or 0:.0f} MiB)\n"
+            f"Recordings are likely not being saved (clips will be missing). "
+            f"Restart Frigate: <code>docker compose restart frigate</code>\n"
+            f"<b>Alert:</b> {alert_count}/{MAX_HEALTH_ALERTS}\n"
+            f"<b>Time:</b> {timestamp_str}"
+        )
+
+    def format_recovery_alert(
+        self,
+        camera: str,
+        current_fps: float,
+        downtime_seconds: float,
+        timestamp_str: str | None = None,
+    ) -> str:
+        """Storage wording for the recovery alert (fps arg is ignored)."""
+        if timestamp_str is None:
+            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"✅ <b>Frigate recording cache recovered</b>\n\n"
+            f"<b>Cache:</b> {html.escape(camera)} {self.last_pct or 0:.0f}%\n"
+            f"<b>Duration:</b> {format_downtime(downtime_seconds)}\n"
+            f"<b>Time:</b> {timestamp_str}"
+        )

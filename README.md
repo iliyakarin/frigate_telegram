@@ -16,6 +16,7 @@ A Python bot that polls [Frigate NVR](https://frigate.video/) for detection even
 - **Persistent state** — notification toggle survives container restarts (JSON file)
 - **Retry logic** — automatically retries media fetches if Frigate hasn't generated them yet
 - **Graceful fallback** — HD video → GIF preview → snapshot → text-only if media isn't available
+- **Long clips** — a clip over Telegram's 50 MB limit is split into N parts tagged "Part i/N" (at most 10 are sent; the last one notes the truncation)
 - **Tunnel-safe timeouts** — configurable `UPLOAD_TIMEOUT` for slow connections
 - **Optimized Docker image** — slim Python base, ~60MB
 
@@ -53,6 +54,7 @@ docker compose logs -f
 | `TELEGRAM_CHAT_ID` | ✅ | — | Target chat/group ID for notifications |
 | `MONITOR_CONFIG` | ❌ | *(all)* | Camera/zone matrix — see [below](#-monitor-config) |
 | `HEALTH_MONITOR_CAMERAS` | ❌ | *(all)* | Comma-separated or JSON list of cameras to monitor for health alerts (defaults to all) |
+| `HEALTH_CACHE_THRESHOLD_PCT` | ❌ | `85` | Alert when Frigate's `/tmp/cache` usage reaches this percent (1–100); a full cache means recordings stopped being saved |
 | `EXTERNAL_URL` | ❌ | — | Public Frigate URL for clickable event links (e.g. via Cloudflare Tunnel) |
 | `FRIGATE_USERNAME` | ❌ | — | Basic auth username (if Frigate auth is enabled) |
 | `FRIGATE_PASSWORD` | ❌ | — | Basic auth password |
@@ -61,6 +63,7 @@ docker compose logs -f
 | `MAX_EVENT_SPAN` | ❌ | `300` | Hard cap (seconds) on a merged notification's duration, so continuously recurring activity still gets sent eventually |
 | `CLIP_PADDING_SECONDS` | ❌ | `5` | Extra seconds included before each event starts and after it ends in that event's sent clip |
 | `UPLOAD_TIMEOUT` | ❌ | `60` | Seconds for Telegram upload timeout (increase for slow tunnels) |
+| `MAX_TELEGRAM_FILE_SIZE` | ❌ | `52428800` | Max bytes per uploaded video (Telegram bot limit, 50 MB). Larger clips are split into up to 10 time-sliced parts |
 | `TIMEZONE` | ❌ | `UTC` | Timezone for timestamps (e.g. `America/Chicago`) |
 | `LOCALES` | ❌ | `en-US` | Locale for date formatting |
 | `DEBUG` | ❌ | `false` | Enable verbose logging |
@@ -174,6 +177,7 @@ The bot continuously monitors camera connection quality and frame rates via Frig
 - **Dual-Check Error Details:** When an alert is triggered, the bot inspects Frigate's `/api/logs/frigate` to extract relevant ffmpeg/demuxing errors. If log access is unavailable, it falls back cleanly to stats data.
 - **Recovery Notification:** When a camera reconnects and begins receiving frames again, the bot sends a recovery alert with the total downtime duration and resets all counters.
 - **Configurable Scope:** By default, all cameras reported by Frigate are monitored. Use `HEALTH_MONITOR_CAMERAS` to limit monitoring to specific cameras.
+- **Recording cache alert:** The bot also watches Frigate's `/tmp/cache` usage (same `/api/stats` payload). If it stays at or above `HEALTH_CACHE_THRESHOLD_PCT` (default 85%), Frigate's recording maintainer has likely stalled and clips come back empty — you get an alert (same debounce and escalation schedule as cameras) suggesting a Frigate restart, then a recovery message once the cache drains. `/status` shows the current cache usage.
 - **Independent of `/disable`:** Camera health alerts keep running even while event notifications are turned off via `/disable` — the two are checked independently every polling cycle.
 
 ## 🤖 Telegram Commands

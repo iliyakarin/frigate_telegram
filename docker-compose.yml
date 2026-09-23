@@ -40,6 +40,8 @@ services:
       # Camera Health Alerts (offline/disconnected notifications)
       # Comma-separated or JSON list of cameras to monitor. Omit to monitor all cameras.
       # - HEALTH_MONITOR_CAMERAS=front_door,back_camera
+      # Alert when Frigate's /tmp/cache usage >= this % (recording maintainer stalled). Default: 85
+      # - HEALTH_CACHE_THRESHOLD_PCT=85
 
       # Night-Only Alerts (suppress notifications outside configured window)
       # - NIGHT_ALERT_CAMERAS=Kitchen,LivingRoom
