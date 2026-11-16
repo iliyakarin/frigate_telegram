@@ -21,6 +21,8 @@ COPY main.py grouping.py camera_health.py .
 # Create data dir with correct ownership
 RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
+ENV MALLOC_TRIM_THRESHOLD_=65536 PYTHONMALLOC=malloc
+
 USER appuser
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \

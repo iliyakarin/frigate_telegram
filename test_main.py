@@ -37,6 +37,31 @@ def _epoch_at(hour, minute):
     return datetime(2024, 1, 1, hour, minute, tzinfo=main._CACHED_TZ).timestamp()
 
 
+def _make_stream_cm(chunks=(b"x" * 150,), headers=None, raise_exc=None, aiter_spy=None, stream_exc=None):
+    """Build a mock async context manager matching httpx.AsyncClient.stream()."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = headers or {}
+    if raise_exc is not None:
+        resp.raise_for_status.side_effect = raise_exc
+    else:
+        resp.raise_for_status = MagicMock()
+
+    async def _aiter_bytes(_chunk_size=65536):
+        for chunk in chunks:
+            if aiter_spy is not None:
+                aiter_spy.append(len(chunk))
+            yield chunk
+        if stream_exc is not None:
+            raise stream_exc
+
+    resp.aiter_bytes = _aiter_bytes
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
 @contextmanager
 def _night_alert_config(cameras, start=None, end=None):
     """Temporarily override NIGHT_ALERT_CAMERAS/START/END for a test, restoring
@@ -1197,20 +1222,274 @@ class TestAsyncLogic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["params"]["has_clip"], 1)
 
     async def test_fetch_recording_clip_url(self):
-        mock_client = AsyncMock()
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.content = b"x" * 150  # > 100 bytes to pass size check
-        mock_client.get.return_value = mock_resp
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _make_stream_cm(chunks=(b"x" * 150,))
 
-        await main.fetch_recording_clip(mock_client, "cam1", 1000, 1030)
+        data = await main.fetch_recording_clip(mock_client, "cam1", 1000, 1030)
 
-        args, kwargs = mock_client.get.call_args
-        url = args[0]
+        self.assertEqual(data, b"x" * 150)
+        args, _kwargs = mock_client.stream.call_args
+        self.assertEqual(args[0], "GET")
+        url = args[1]
         # Should NOT have /recordings/
         self.assertNotIn("/recordings/", url)
         # main.FRIGATE_URL is http://localhost:5000 in test setup
         self.assertIn("/api/cam1/start/1000/end/1030/clip.mp4", url)
+
+    async def test_fetch_media_with_retry_aborts_when_content_length_exceeds_limit(self):
+        iterated = []
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _make_stream_cm(
+            headers={"content-length": "5000"},
+            chunks=(b"x" * 5000,),
+            aiter_spy=iterated,
+        )
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            res = await main.fetch_media_with_retry(mock_client, "http://localhost/clip.mp4", "clip")
+
+        self.assertTrue(res)
+        self.assertNotIsInstance(res, bytes)
+        self.assertEqual(len(res), 5000)
+        self.assertEqual(iterated, [])
+
+    async def test_fetch_media_with_retry_discards_buffer_when_stream_exceeds_limit(self):
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _make_stream_cm(
+            headers={},
+            chunks=(b"a" * 600, b"b" * 600, b"c" * 300),
+        )
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            res = await main.fetch_media_with_retry(mock_client, "http://localhost/clip.mp4", "clip")
+
+        self.assertTrue(res)
+        self.assertNotIsInstance(res, bytes)
+        self.assertEqual(len(res), 1500)
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot", return_value=b"snap")
+    @patch("main.fetch_recording_clip", return_value=b"clip_bytes")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_ongoing_event_uses_now_for_recording_window(
+        self, mock_details, mock_clip, _mock_snap, _mock_media
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {
+            "id": "e1",
+            "label": "person",
+            "zones": [],
+            "start_time": 900,
+            "end_time": None,
+        }
+        group = grouping.PendingGroup(
+            camera="Backyard",
+            labels={"person"},
+            review_ids=["rev1"],
+            event_ids={"e1"},
+            first_start=900,
+            last_activity_end=900,
+            last_seen_at=900,
+        )
+
+        with patch("main.time.time", return_value=1000.0):
+            await main.send_grouped_notification(bot, group, http_client)
+
+        pad = main.CLIP_PADDING_SECONDS
+        mock_clip.assert_called_once_with(http_client, "Backyard", 900 - pad, 1000 + pad)
+        bot.send_video.assert_called_once()
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot", return_value=b"snap_bytes")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_streams_split_parts_without_buffering_all_in_ram(
+        self, mock_details, mock_clip, _mock_snap, _mock_media
+    ):
+        order = []
+        bot = MagicMock()
+
+        async def send_side_effect(**kwargs):
+            order.append(("send", kwargs["video"]))
+
+        bot.send_video = AsyncMock(side_effect=send_side_effect)
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+
+        ps, pe = self._padded_window()
+        windows = self._expected_windows(ps, pe, 5)
+        responses = {(ps, pe): b"x" * 3800}
+        responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
+
+        async def clip_side_effect(_client, _camera, start, end, **_kwargs):
+            order.append(("fetch", start, end))
+            return responses.get((start, end))
+
+        mock_clip.side_effect = clip_side_effect
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.send_grouped_notification(bot, self._long_single_event_group(), http_client)
+
+        send_part1_idx = order.index(("send", b"part1"))
+        fetch_part3_idx = order.index(("fetch", windows[2][0], windows[2][1]))
+        self.assertLess(send_part1_idx, fetch_part3_idx)
+
+    @patch("asyncio.sleep")
+    async def test_fetch_media_with_retry_retries_404_network_and_small_body(self, _mock_sleep):
+        req = httpx.Request("GET", "http://localhost/clip.mp4")
+        not_found_resp = httpx.Response(404, request=req)
+        mock_client = MagicMock()
+        mock_client.stream.side_effect = [
+            _make_stream_cm(raise_exc=httpx.HTTPStatusError("404", request=req, response=not_found_resp)),
+            _make_stream_cm(chunks=(b"a" * 50,), stream_exc=httpx.RequestError("drop", request=req)),
+            _make_stream_cm(chunks=(b"tiny",)),
+            _make_stream_cm(chunks=(b"x" * 150,)),
+        ]
+
+        res = await main.fetch_media_with_retry(
+            mock_client, "http://localhost/clip.mp4", "clip", max_retries=4
+        )
+        self.assertEqual(res, b"x" * 150)
+        self.assertEqual(mock_client.stream.call_count, 4)
+
+    async def test_fetch_media_with_retry_ignores_non_ascii_or_invalid_content_length(self):
+        for bad_cl in ("abc", "-5", "²"):
+            mock_client = MagicMock()
+            mock_client.stream.return_value = _make_stream_cm(
+                headers={"content-length": bad_cl},
+                chunks=(b"x" * 150,),
+            )
+            res = await main.fetch_media_with_retry(mock_client, "http://localhost/clip.mp4", "clip")
+            self.assertEqual(res, b"x" * 150)
+
+    async def test_fetch_camera_snapshot_returns_none_on_oversized_and_cmd_photo_handles(self):
+        mock_client = MagicMock()
+        mock_client.stream.return_value = _make_stream_cm(
+            headers={"content-length": "5000"},
+            chunks=(b"x" * 5000,),
+        )
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            snap = await main.fetch_camera_snapshot(mock_client, "Garage")
+        self.assertIsNone(snap)
+
+        update = AsyncMock()
+        update.effective_chat.id = main.TELEGRAM_CHAT_ID
+        context = MagicMock()
+        context.args = ["Garage"]
+        context.bot_data = {"http_client": mock_client}
+        mock_client.stream.return_value = _make_stream_cm(
+            headers={"content-length": "5000"},
+            chunks=(b"x" * 5000,),
+        )
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.cmd_photo(update, context)
+        update.effective_chat.send_photo.assert_not_called()
+        update.effective_chat.send_message.assert_called_once()
+
+        update_all = AsyncMock()
+        update_all.effective_chat.id = main.TELEGRAM_CHAT_ID
+        context_all = MagicMock()
+        context_all.bot_data = {"http_client": mock_client}
+        mock_client.stream.return_value = _make_stream_cm(
+            headers={"content-length": "5000"},
+            chunks=(b"x" * 5000,),
+        )
+        with patch("main.fetch_camera_list", return_value=["Garage"]), patch.object(
+            main, "MAX_TELEGRAM_FILE_SIZE", 1000
+        ):
+            await main.cmd_photo_all(update_all, context_all)
+        update_all.effective_chat.send_photo.assert_not_called()
+        update_all.effective_chat.send_message.assert_called_once()
+
+    @patch("asyncio.sleep")
+    @patch("main.fetch_recording_clip", return_value=None)
+    @patch("main.fetch_event_details", return_value=None)
+    @patch("main.fetch_event_media")
+    async def test_fetch_video_data_robust_breaks_early_on_oversized_event_clip(
+        self, mock_media, _mock_details, _mock_clip, mock_sleep
+    ):
+        mock_media.return_value = main._OversizedMedia(9999)
+        res = await main.fetch_video_data_robust(MagicMock(), "Backyard", event_id="e1")
+        self.assertIsNone(res)
+        mock_media.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    @patch("main.fetch_event_media", return_value=None)
+    @patch("main.fetch_camera_snapshot", return_value=b"snap")
+    @patch("main.fetch_recording_clip", return_value=b"clip_bytes")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_ongoing_event_clamps_inverted_clock(
+        self, mock_details, mock_clip, _mock_snap, _mock_media
+    ):
+        bot = MagicMock()
+        bot.send_video = AsyncMock()
+        http_client = MagicMock()
+        mock_details.return_value = {
+            "id": "e1",
+            "label": "person",
+            "zones": [],
+            "start_time": 1100,
+            "end_time": None,
+        }
+        group = grouping.PendingGroup(
+            camera="Backyard",
+            labels={"person"},
+            review_ids=["rev1"],
+            event_ids={"e1"},
+            first_start=1100,
+            last_activity_end=1100,
+            last_seen_at=1100,
+        )
+
+        with patch("main.time.time", return_value=1000.0):
+            await main.send_grouped_notification(bot, group, http_client)
+
+        pad = main.CLIP_PADDING_SECONDS
+        mock_clip.assert_called_once_with(http_client, "Backyard", 1100 - pad, 1100 - pad)
+
+    @patch("main.fetch_event_media")
+    @patch("main.fetch_camera_snapshot", return_value=b"snap_bytes")
+    @patch("main.fetch_recording_clip")
+    @patch("main.fetch_event_details")
+    async def test_send_grouped_notification_split_upload_failure_first_vs_second_part(
+        self, mock_details, mock_clip, _mock_snap, mock_media
+    ):
+        http_client = MagicMock()
+        mock_details.return_value = {"id": "e1", "label": "person", "zones": [], "start_time": 100, "end_time": 200}
+        ps, pe = self._padded_window()
+        windows = self._expected_windows(ps, pe, 5)
+        responses = {(ps, pe): b"x" * 3800}
+        responses.update({w: f"part{i}".encode() for i, w in enumerate(windows, start=1)})
+        mock_clip.side_effect = lambda _c, _cam, s, e, **_kw: responses.get((s, e))
+
+        # 1. Failure on Part 1 triggers GIF fallback without sending duplicate fallback photo
+        bot1 = MagicMock()
+        bot1.send_video = AsyncMock(side_effect=RuntimeError("upload failed"))
+        bot1.send_animation = AsyncMock()
+        bot1.send_photo = AsyncMock()
+        mock_media.side_effect = lambda _c, _eid, kind: b"gif_bytes" if kind == "gif" else None
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.send_grouped_notification(bot1, self._long_single_event_group(), http_client)
+        bot1.send_animation.assert_called_once()
+        bot1.send_photo.assert_not_called()
+
+        # 2. Failure on Part 2 after Part 1 succeeded must NOT send fallback GIF or photo
+        bot2 = MagicMock()
+        bot2.send_video = AsyncMock(side_effect=[None, RuntimeError("part2 failed")])
+        bot2.send_animation = AsyncMock()
+        bot2.send_photo = AsyncMock()
+        mock_media.reset_mock()
+        mock_media.side_effect = None
+        mock_media.return_value = None
+
+        with patch.object(main, "MAX_TELEGRAM_FILE_SIZE", 1000):
+            await main.send_grouped_notification(bot2, self._long_single_event_group(), http_client)
+        self.assertEqual(bot2.send_video.call_count, 2)
+        bot2.send_animation.assert_not_called()
+        bot2.send_photo.assert_not_called()
 
     @patch("main.trigger_manual_event")
     @patch("main.fetch_event_media")
