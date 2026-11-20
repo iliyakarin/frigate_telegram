@@ -63,5 +63,29 @@ services:
     volumes:
       - frigate-telegram-data:/app/data                # Persist notification state across restarts
 
+  # ── Camera Watchdog (optional: auto-reboots 0-FPS Amcrest/Dahua cameras) ──
+  # Enable with: docker compose --profile watchdog up -d
+  camera-watchdog:
+    image: ghcr.io/ikarin/frigate-telegram:latest
+    container_name: frigate-camera-watchdog
+    profiles: ["watchdog"]
+    command: ["python", "-u", "camera_watchdog.py"]
+    restart: unless-stopped
+    # depends_on:
+    #   - frigate
+    environment:
+      - FRIGATE_URL=http://frigate:5000
+      - FRIGATE_RTSP_USER=admin
+      - FRIGATE_RTSP_PASSWORD=your-camera-password
+      - WATCHDOG_CAMERAS=Garage,FrontPorch
+      - TELEGRAM_BOT_TOKEN=your-bot-token-here
+      - TELEGRAM_CHAT_ID=your-chat-id-here
+      # - FRIGATE_USERNAME=
+      # - FRIGATE_PASSWORD=
+      # - WATCHDOG_ZERO_FPS_SECONDS=300                # Reboot after 5m at 0 FPS (default: 300)
+      # - WATCHDOG_COOLDOWN_SECONDS=900                # Wait 15m before rebooting same camera again (default: 900)
+      # - WATCHDOG_POLL_INTERVAL=30                    # Seconds between stats polls (default: 30)
+      # - DEBUG=false
+
 volumes:
   frigate-telegram-data:

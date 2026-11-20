@@ -55,6 +55,12 @@ docker compose logs -f
 | `MONITOR_CONFIG` | ❌ | *(all)* | Camera/zone matrix — see [below](#-monitor-config) |
 | `HEALTH_MONITOR_CAMERAS` | ❌ | *(all)* | Comma-separated or JSON list of cameras to monitor for health alerts (defaults to all) |
 | `HEALTH_CACHE_THRESHOLD_PCT` | ❌ | `85` | Alert when Frigate's `/tmp/cache` usage reaches this percent (1–100); a full cache means recordings stopped being saved |
+| `WATCHDOG_CAMERAS` | ❌* | — | *(Watchdog service)* Comma-separated or JSON list of cameras to auto-reboot on sustained 0 FPS (*required when running `camera-watchdog`) |
+| `FRIGATE_RTSP_USER` | ❌* | — | *(Watchdog service)* Camera HTTP Digest username for `/cgi-bin/magicBox.cgi?action=reboot` |
+| `FRIGATE_RTSP_PASSWORD` | ❌* | — | *(Watchdog service)* Camera HTTP Digest password |
+| `WATCHDOG_ZERO_FPS_SECONDS` | ❌ | `300` | *(Watchdog service)* Continuous 0-FPS duration (seconds) before triggering a camera reboot |
+| `WATCHDOG_COOLDOWN_SECONDS` | ❌ | `900` | *(Watchdog service)* Minimum cooldown (seconds) before the same camera can be rebooted again |
+| `WATCHDOG_POLL_INTERVAL` | ❌ | `30` | *(Watchdog service)* Seconds between `/api/stats` checks |
 | `EXTERNAL_URL` | ❌ | — | Public Frigate URL for clickable event links (e.g. via Cloudflare Tunnel) |
 | `FRIGATE_USERNAME` | ❌ | — | Basic auth username (if Frigate auth is enabled) |
 | `FRIGATE_PASSWORD` | ❌ | — | Basic auth password |
@@ -179,6 +185,20 @@ The bot continuously monitors camera connection quality and frame rates via Frig
 - **Configurable Scope:** By default, all cameras reported by Frigate are monitored. Use `HEALTH_MONITOR_CAMERAS` to limit monitoring to specific cameras.
 - **Recording cache alert:** The bot also watches Frigate's `/tmp/cache` usage (same `/api/stats` payload). If it stays at or above `HEALTH_CACHE_THRESHOLD_PCT` (default 85%), Frigate's recording maintainer has likely stalled and clips come back empty — you get an alert (same debounce and escalation schedule as cameras) suggesting a Frigate restart, then a recovery message once the cache drains. `/status` shows the current cache usage.
 - **Independent of `/disable`:** Camera health alerts keep running even while event notifications are turned off via `/disable` — the two are checked independently every polling cycle.
+
+## 🔁 Camera Watchdog (Optional Auto-Reboot)
+
+Some IP cameras (such as older Amcrest/Dahua Wi-Fi or PoE models) occasionally wedge their RTSP encoder while staying reachable over HTTP. The image ships with an optional standalone module, `camera_watchdog.py`, that automatically reboots listed cameras when their `camera_fps` stays at `0` for more than 5 minutes.
+
+- **Auto-Resolved Camera IPs:** Queries Frigate's `/api/config` and extracts each camera's IP/hostname automatically — even when Frigate reads through local `go2rtc` restreams (`rtsp://127.0.0.1:8554/<stream>` or `ffmpeg:rtsp://127.0.0.1:8554/<stream>#video=copy`).
+- **Digest-Authenticated CGI Reboot:** Sends `GET http://<ip>/cgi-bin/magicBox.cgi?action=reboot` using HTTP Digest Auth (`FRIGATE_RTSP_USER` / `FRIGATE_RTSP_PASSWORD`).
+- **Startup Grace & Cooldown:** Ignores 0-FPS readings during Frigate's first 60 seconds of uptime and enforces a 15-minute per-camera cooldown (`WATCHDOG_COOLDOWN_SECONDS=900`) after each reboot.
+- **Telegram Notification:** Sends a short notification to `TELEGRAM_CHAT_ID` whenever a camera is auto-rebooted.
+- **Opt-In via Docker Compose Profile:** Disabled by default (`profiles: ["watchdog"]`). Start it alongside the bot with:
+  ```bash
+  docker compose --profile watchdog up -d
+  ```
+  *(Or remove the `profiles: ["watchdog"]` line in `docker-compose.yml` to always start it with `docker compose up -d`.)*
 
 ## 🤖 Telegram Commands
 
