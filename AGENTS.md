@@ -29,6 +29,7 @@ This document defines the strict engineering, testing, and deployment rules for 
 - **Test Suites**:
   - `test_main.py` — Core application, API polling, notifications, command handlers.
   - `test_camera_health.py` — Camera health and Frigate cache-storage monitoring/alerts.
+  - `test_camera_watchdog.py` — Standalone camera recovery watchdog (`camera_watchdog.py`).
   - `test_grouping.py` — Event grouping and debounce window logic.
   - `test_security.py` — Authorization and access control.
   - `test_state.py` — Persistent notification state management.
