@@ -35,7 +35,7 @@ def merge_into_pending(
     review: dict,
     now: float,
     merge_gap: int,
-) -> None:
+) -> bool:
     """Merge a Frigate review item into an existing pending group, or start a new one.
 
     A review item joins an existing group only if that group is on the same
@@ -63,15 +63,26 @@ def merge_into_pending(
             last_activity_end=end_time,
             last_seen_at=now,
         )
-        return
+        return True
 
     group = pending[key]
+    is_new_review = review_id not in group.review_ids
+    has_new_detections = not detections.issubset(group.event_ids)
+    has_new_labels = not labels.issubset(group.labels)
+    extended_end = end_time > group.last_activity_end
+    is_still_open = review.get("end_time") is None
+    changed = is_new_review or has_new_detections or has_new_labels or extended_end or is_still_open
+
     group.labels |= labels
-    group.review_ids.append(review_id)
+    if is_new_review:
+        group.review_ids.append(review_id)
     group.event_ids |= detections
     group.first_start = min(group.first_start, start_time)
     group.last_activity_end = max(group.last_activity_end, end_time)
-    group.last_seen_at = now
+    if changed:
+        group.last_seen_at = now
+        return True
+    return False
 
 
 def split_ready_groups(

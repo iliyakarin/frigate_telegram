@@ -2058,6 +2058,132 @@ class TestPollingTick(unittest.IsolatedAsyncioTestCase):
         # Garage isn't in NIGHT_ALERT_CAMERAS, so it must still be held.
         self.assertEqual(len(pending), 1)
 
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_polling_tick_refetches_and_merges_in_place_updated_pending_review(
+        self, mock_fetch_reviews, mock_send
+    ):
+        """Regression for the 21:24 Garage bug: Frigate appends a second
+        detection ('vhnxf1') in-place to an existing review item ('sw6351')
+        whose start_time (100) is earlier than last_poll_ts (105). While
+        'sw6351' is in pending, _polling_tick must look back to its
+        first_start (100), merge the new detection and extended end_time,
+        refresh last_seen_at on the update, and then finalize after the
+        quiet debounce window without starving when the closed review is
+        re-polled unchanged."""
+        bot = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
+        mock_send.return_value = None
+
+        r1_initial = {
+            "id": "sw6351",
+            "camera": "Garage",
+            "start_time": 100,
+            "end_time": 104,
+            "data": {"objects": ["person"], "detections": ["b372u1"], "zones": ["notification_zone"]},
+        }
+        r1_updated = {
+            "id": "sw6351",
+            "camera": "Garage",
+            "start_time": 100,
+            "end_time": 128,
+            "data": {"objects": ["person"], "detections": ["b372u1", "vhnxf1"], "zones": ["notification_zone"]},
+        }
+
+        with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+            pending = {}
+
+            # Tick 1 (now=105, last_poll_ts=90): initial review arrives and is held in pending.
+            mock_fetch_reviews.return_value = [r1_initial]
+            last_poll_ts = await main._polling_tick(bot, http_client, pending, last_poll_ts=90, now=105)
+            mock_fetch_reviews.assert_called_with(http_client, 90)
+            self.assertEqual(last_poll_ts, 105)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending["sw6351"].event_ids, {"b372u1"})
+            mock_send.assert_not_called()
+
+            # Tick 2 (now=135, last_poll_ts=105): Frigate updated sw6351 in-place with vhnxf1.
+            # _polling_tick must query with after_ts=100 (min(105, 100)) so sw6351 is re-fetched.
+            mock_fetch_reviews.side_effect = lambda _client, after_ts: [r1_updated] if after_ts <= 100 else []
+            last_poll_ts = await main._polling_tick(bot, http_client, pending, last_poll_ts=last_poll_ts, now=135)
+            mock_fetch_reviews.assert_called_with(http_client, 100)
+            self.assertEqual(last_poll_ts, 135)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending["sw6351"].event_ids, {"b372u1", "vhnxf1"})
+            self.assertEqual(pending["sw6351"].last_activity_end, 128)
+            self.assertEqual(pending["sw6351"].last_seen_at, 135)
+            mock_send.assert_not_called()
+
+            # Tick 3 (now=181, last_poll_ts=135): 46s (>= 45s EVENT_MERGE_GAP) after the update at 135.
+            # Even though the lookback query still returns the unchanged closed r1_updated,
+            # last_seen_at must NOT be reset to 181, so the group finalizes and sends both events.
+            last_poll_ts = await main._polling_tick(bot, http_client, pending, last_poll_ts=last_poll_ts, now=181)
+            self.assertEqual(pending, {})
+            mock_send.assert_called_once()
+            sent_group = mock_send.call_args.args[1]
+            self.assertEqual(sent_group.camera, "Garage")
+            self.assertEqual(sent_group.review_ids, ["sw6351"])
+            self.assertEqual(sent_group.event_ids, {"b372u1", "vhnxf1"})
+            self.assertEqual(sent_group.last_activity_end, 128)
+
+    @patch("main.send_grouped_notification")
+    @patch("main.fetch_review_items")
+    async def test_polling_tick_lookback_ignores_already_sent_reviews_from_other_cameras(
+        self, mock_fetch_reviews, mock_send
+    ):
+        """When pending holds a group starting at t=100 and last_poll_ts is
+        130, the lookback query (after_ts=100) may also return an older
+        review (t=115 < last_poll_ts) that was already finalized and is no
+        longer in pending. _polling_tick must ignore that non-pending older
+        review rather than re-queuing it."""
+        bot = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=MagicMock(
+            status_code=200,
+            json=MagicMock(return_value={"service": {"uptime": 0}, "cameras": {}}),
+        ))
+        mock_send.return_value = None
+
+        pending_review = {
+            "id": "rev_pending",
+            "camera": "Garage",
+            "start_time": 100,
+            "end_time": 110,
+            "data": {"objects": ["person"], "detections": ["e1"], "zones": []},
+        }
+        already_sent_review = {
+            "id": "rev_already_sent",
+            "camera": "Backyard",
+            "start_time": 115,
+            "end_time": 120,
+            "data": {"objects": ["car"], "detections": ["e_old"], "zones": []},
+        }
+
+        with patch.dict(main.MONITOR_CONFIG, {}, clear=True):
+            pending = {
+                "rev_pending": grouping.PendingGroup(
+                    camera="Garage",
+                    labels={"person"},
+                    review_ids=["rev_pending"],
+                    event_ids={"e1"},
+                    first_start=100,
+                    last_activity_end=110,
+                    last_seen_at=110,
+                )
+            }
+            mock_fetch_reviews.return_value = [pending_review, already_sent_review]
+
+            await main._polling_tick(bot, http_client, pending, last_poll_ts=130, now=135)
+
+            # rev_already_sent has start_time (115) < last_poll_ts (130) and is not in pending,
+            # so it must NOT be added to pending.
+            self.assertEqual(list(pending.keys()), ["rev_pending"])
+            mock_send.assert_not_called()
+
 
 class TestMatchesMonitorConfig(unittest.TestCase):
     def test_matches_monitor_config(self):

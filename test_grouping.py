@@ -63,6 +63,50 @@ class TestMergeIntoPending(unittest.TestCase):
         group = next(iter(pending.values()))
         self.assertEqual(group.labels, {"person", "dog"})
 
+    def test_repolling_unchanged_closed_review_does_not_reset_last_seen_at_or_duplicate_id(self):
+        pending = {}
+        r1 = self._review("r1", "Garage", ["person"], ["e1"], 100, 110)
+        created = merge_into_pending(pending, r1, now=110, merge_gap=45)
+        updated = merge_into_pending(pending, r1, now=140, merge_gap=45)
+
+        group = next(iter(pending.values()))
+        self.assertEqual(group.review_ids, ["r1"])
+        self.assertEqual(group.last_seen_at, 110)
+        self.assertTrue(created)
+        self.assertFalse(updated)
+
+        ready = split_ready_groups(pending, now=156, merge_gap=45, max_span=300)
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(pending, {})
+
+    def test_repolling_in_place_updated_review_adds_detections_and_refreshes_last_seen_at(self):
+        pending = {}
+        r1_initial = self._review("r1", "Garage", ["person"], ["e1"], 100, 104)
+        created = merge_into_pending(pending, r1_initial, now=105, merge_gap=45)
+
+        r1_updated = self._review("r1", "Garage", ["person"], ["e1", "e2"], 100, 128)
+        updated = merge_into_pending(pending, r1_updated, now=130, merge_gap=45)
+
+        group = next(iter(pending.values()))
+        self.assertEqual(group.review_ids, ["r1"])
+        self.assertEqual(group.event_ids, {"e1", "e2"})
+        self.assertEqual(group.last_activity_end, 128)
+        self.assertEqual(group.last_seen_at, 130)
+        self.assertTrue(created)
+        self.assertTrue(updated)
+
+    def test_repolling_open_review_with_none_end_time_refreshes_last_seen_at(self):
+        pending = {}
+        r1_open = self._review("r1", "Garage", ["person"], ["e1"], 100, None)
+        created = merge_into_pending(pending, r1_open, now=105, merge_gap=45)
+        updated = merge_into_pending(pending, r1_open, now=130, merge_gap=45)
+
+        group = next(iter(pending.values()))
+        self.assertEqual(group.review_ids, ["r1"])
+        self.assertEqual(group.last_seen_at, 130)
+        self.assertTrue(created)
+        self.assertTrue(updated)
+
 
 class TestSplitReadyGroups(unittest.TestCase):
     def test_group_not_ready_within_merge_gap(self):

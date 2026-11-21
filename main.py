@@ -1806,24 +1806,28 @@ async def _polling_tick(
     new_last_poll_ts = last_poll_ts
     try:
         if notifications_enabled:
-            reviews = await fetch_review_items(http_client, last_poll_ts)
-            new_last_poll_ts = time.time()
+            pending_review_ids = {rid for g in pending.values() for rid in g.review_ids}
+            query_after_ts = min(last_poll_ts, *(g.first_start for g in pending.values())) if pending else last_poll_ts
+            reviews = await fetch_review_items(http_client, query_after_ts)
+            new_last_poll_ts = now
 
             matched = [
                 r for r in reviews
-                if matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
+                if (r.get("start_time", 0) >= last_poll_ts or r.get("id") in pending_review_ids)
+                and matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
                 and matches_night_alert_schedule(r.get("camera", ""), now)
             ]
-            for review in matched:
-                merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
+            active_updates = sum(
+                1 for review in matched if merge_into_pending(pending, review, now, EVENT_MERGE_GAP)
+            )
 
             ready = split_ready_groups(pending, now, EVENT_MERGE_GAP, MAX_EVENT_SPAN)
             ready.sort(key=lambda g: g.first_start)
 
-            if matched or ready:
+            if active_updates or ready:
                 logger.info(
                     "Processing %d new review item(s), %d group(s) ready to send",
-                    len(matched), len(ready),
+                    active_updates, len(ready),
                 )
 
             # Sequential, not gather: keeps the chat feed in chronological order.
