@@ -1813,7 +1813,7 @@ async def _polling_tick(
 
             matched = [
                 r for r in reviews
-                if (r.get("start_time", 0) >= last_poll_ts or r.get("id") in pending_review_ids)
+                if ((r.get("start_time") or 0) >= last_poll_ts or r.get("id") in pending_review_ids)
                 and matches_monitor_config(r.get("camera", ""), r.get("data", {}).get("zones", []))
                 and matches_night_alert_schedule(r.get("camera", ""), now)
             ]
